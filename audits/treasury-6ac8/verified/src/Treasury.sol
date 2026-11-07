@@ -1,0 +1,657 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {ISwarmFeed} from "./interfaces/ISwarmFeed.sol";
+import {APPROVED_OPERATOR, ORACLE_ASKER, LAUNCH_FACTORY} from "./DeploymentConfig.sol";
+import {IShareVault} from "./interfaces/IShareVault.sol";
+import {ILaunchFeeShare} from "./interfaces/ILaunchFeeShare.sol";
+import {TransientReentrancyGuard} from "./TransientReentrancyGuard.sol";
+
+/// @notice Where the protocol's own revenue lands: its share of liquidation bonuses, in collateral,
+/// and the stability fees minted to it, in stablecoin. It is also the protocol's reserve, and it can
+/// say what that reserve is worth.
+/// @dev ParameterizedVault creates one in its constructor and routes both revenue streams to it, so
+/// the money is institutionally separate from the person operating the protocol from the first
+/// liquidation onward, and no deployment step can point the revenue at a wallet instead. (The plain
+/// CDPVault still pays FEE_RECIPIENT; a Treasury deployed standalone and named there collects the
+/// same way, with no register.)
+///
+/// It is deliberately almost nothing. Revenue arrives by plain ERC-20 transfer, which notifies no
+/// one, so `sync` is how a balance becomes a recorded receipt. Anyone may call it: recording what
+/// already arrived takes nothing from anybody, and a figure only the operator could refresh would be
+/// worth less than one a observer can.
+///
+/// The reserve register is the one thing added for compute backing. Each accepted asset has a USD
+/// price source and a haircut, and `reserveValueUsd` is the discounted sum — the reserve term of the
+/// vault's work-minting ceiling. Its entries change only through the vault's Parameters contract
+/// (`registrar`), so every listing, delisting and repricing waits the same 48 hours a fee change
+/// does, is readable while it waits, and can be applied by anyone. There is no owner path to it.
+///
+/// It also accepts native ETH, by plain transfer or payout, recorded under `NATIVE` exactly as a
+/// token is: `syncNative` credits it and only the operator moves it out. A launch pool's LP fees are
+/// paid to its requester in BOTH of the pool's currencies, and a pool may be paired with ETH; a
+/// Treasury that refused ETH would leave that half owed forever to an address that can never take it.
+///
+/// What it is NOT: a treasury policy. There is no swap, no liquidity deployment and no accounting of
+/// what revenue was for. Those decisions are not made yet, and a contract that cannot be upgraded is
+/// the wrong place to guess at them. Withdrawal takes its destination as an argument precisely so the
+/// eventual answer — most likely paired liquidity — needs no change here.
+/// @dev Every function that sends funds out (withdraw, withdrawNative, payStream, fundOracle, redeemIMD) is guarded
+/// (TransientReentrancyGuard), on top of writing its state before each transfer: `fundOracle` records the day's
+/// spend only after its transfers, which was safe only because IMD and sIMD have no transfer hooks (final sweep
+/// panel 3 review, 2026-10-09). `sync` stays open: a re-entered sync credits nothing (see `_withdraw`), and
+/// `unwrapForOracle` is fundOracle's own self-call.
+contract Treasury is TransientReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    /// @notice A reserve asset's price source and retained-value factor.
+    /// @param priceFeed USD per whole token, 1e18-scaled, read like any other ISwarmFeed — except for
+    /// the creating vault's own collateral, which is priced per 1e18 RAW units (see `decimals`).
+    /// @param haircutBps The retained-value factor, in basis points: the asset counts for haircutBps /
+    /// 10000 of its market value. Zero counts for nothing; 10000 counts in full. A lower factor
+    /// limits the supply a volatile asset can authorise through a downturn.
+    /// @param decimals The token's decimals, read once at listing, so a 6-decimal stablecoin is not
+    /// priced as if it had 18. Fixed at 18 for the creating vault's collateral, whatever its decimals:
+    /// the vault prices collateral per 1e18 raw units (the only source for sIMD, SharePriceFeed, quotes
+    /// that way), so dividing sIMD's balance by its own 10**24 would undervalue it a million times.
+    /// Found by docs job 2f5a387d.
+    struct ReserveAsset {
+        ISwarmFeed priceFeed;
+        uint256 haircutBps;
+        uint8 decimals;
+    }
+
+    uint256 private constant BPS = 10_000;
+    /// @dev $1e18, 1e18-scaled: far above any real reserve, far below anything a sum could overflow on.
+    uint256 private constant MAX_RESERVE_VALUE = 1e36;
+
+    /// @notice The key native ETH is recorded under in `totalReceived` and `lastSynced`. No ERC-20 can
+    /// live at the zero address, so it cannot collide with a token's record.
+    IERC20 public constant NATIVE = IERC20(address(0));
+
+    /// @notice The vault this treasury serves: whose revenue lands here, whose Parameters governs the
+    /// register, and whose imdUSD may never be reserve. Set by `TreasuryFactory` to the vault calling it
+    /// mid-construction, so it is always the vault that will route its revenue here.
+    address public immutable vault;
+
+    /// @param vault_ The vault this treasury serves. `TreasuryFactory` passes its caller.
+    constructor(address vault_) {
+        vault = vault_;
+    }
+
+    /// @notice Everything this contract has ever been credited with, per token, as recorded by sync.
+    /// @dev A running total, not a balance: it does not fall when funds are withdrawn, so it answers
+    /// "what has the protocol earned" rather than "what is left".
+    mapping(IERC20 token => uint256 amount) public totalReceived;
+
+    /// @notice The balance already counted, per token, so a second sync credits nothing twice.
+    mapping(IERC20 token => uint256 amount) public lastSynced;
+
+    mapping(IERC20 asset => ReserveAsset entry) private _reserve;
+    IERC20[] private _reserveAssets;
+
+    event Received(IERC20 indexed token, uint256 amount, uint256 total);
+    event Withdrawn(IERC20 indexed token, address indexed to, uint256 amount);
+    event ReserveAssetSet(IERC20 indexed asset, ISwarmFeed indexed priceFeed, uint256 haircutBps);
+    event ReserveAssetRemoved(IERC20 indexed asset);
+    event OracleFunded(address indexed asker, uint256 imd, uint256 spentToday);
+    event StreamPaid(address indexed payee, uint256 amount, uint256 paidToday);
+    event LaunchFeesHandedOff(address indexed factory, uint64 indexed launchNumber, address indexed next);
+
+    error Unauthorized();
+    error InvalidRecipient();
+    error ZeroAmount();
+    /// @notice imdUSD can never be a reserve asset: the Treasury receives stability fees in imdUSD, and
+    /// backing a liability with the same liability is not backing.
+    error StablecoinIsNotReserve();
+    error InvalidReserveAsset();
+    error InvalidPriceSource();
+    error HaircutOutOfRange(uint256 bps);
+    error NotAReserveAsset();
+    error OracleAskerMissing();
+    error NativeTransferFailed();
+    error ReserveProtected(IERC20 token);
+    /// @dev Gas a reserve read may spend; see `_boundedCall`.
+    uint256 private constant RESERVE_READ_GAS = 200_000;
+    /// @dev Gas the best-effort share unwrap in `fundOracle` is given, and the floor the caller must bring
+    /// for it. A caught call must get a FIXED stipend: given whatever is left, a transaction sent at an
+    /// estimated gas limit starves the unwrap (eth_estimateGas finds the smallest limit at which the outer
+    /// call does not revert, and with the unwrap's out-of-gas caught that limit is one at which it fails),
+    /// so the keeper's fundOracle unwrapped nothing on the fork rehearsal. sIMD's withdraw is about 95k.
+    uint256 private constant UNWRAP_GAS = 300_000;
+    error InsufficientGasForUnwrap(uint256 needed, uint256 left);
+    error BadDebtFirst(uint256 outstanding);
+    error NoStream();
+
+    // --- the register ---------------------------------------------------------------------------
+
+    /// @notice The only account that may change the register: the creating vault's Parameters
+    /// contract, resolved from the vault. Zero — and the register frozen empty — for a Treasury
+    /// whose creator has none, such as one deployed standalone.
+    /// @dev Read through the vault rather than stored, because the vault's `parameters` is an
+    /// immutable it sets in the same construction that creates this contract: there is nothing to
+    /// bind afterwards and no second transaction in which to bind the wrong thing.
+    function registrar() public view returns (address) {
+        return _linked(abi.encodeWithSignature("parameters()"));
+    }
+
+    function reserveAssets() external view returns (IERC20[] memory) {
+        return _reserveAssets;
+    }
+
+    function reserveAssetCount() external view returns (uint256) {
+        return _reserveAssets.length;
+    }
+
+    function reserveAsset(IERC20 asset) external view returns (ReserveAsset memory) {
+        return _reserve[asset];
+    }
+
+    function isReserveAsset(IERC20 asset) public view returns (bool) {
+        return address(_reserve[asset].priceFeed) != address(0);
+    }
+
+    /// @notice Refuse a listing the register would refuse, with the same error. Parameters calls
+    /// this when a change is PROPOSED, so an invalid one never occupies the slot or the two days.
+    /// @dev A zero price source means removal, which needs the asset to be listed and no haircut.
+    function validateReserveAsset(IERC20 asset, ISwarmFeed priceFeed, uint256 haircutBps) public view {
+        if (address(asset) == _linked(abi.encodeWithSignature("stablecoin()"))) revert StablecoinIsNotReserve();
+        if (address(asset) == address(0) || address(asset).code.length == 0) revert InvalidReserveAsset();
+        if (address(priceFeed) == address(0)) {
+            if (!isReserveAsset(asset)) revert NotAReserveAsset();
+            if (haircutBps != 0) revert HaircutOutOfRange(haircutBps);
+            return;
+        }
+        if (address(priceFeed).code.length == 0) revert InvalidPriceSource();
+        // The vault's own collateral is valued per 1e18 raw units, so it may be listed only against the
+        // vault's own collateral price (launch audit, three panels, low): listed against the per-IMD
+        // usdPriceFeed, sIMD read about 125,000x too high and inflated earnLine and backing with it.
+        if (address(asset) == _linked(abi.encodeWithSignature("gem()"))) {
+            address collateralPrice = _linked(abi.encodeWithSignature("collateralPriceFeed()"));
+            if (collateralPrice != address(0) && address(priceFeed) != collateralPrice) revert InvalidPriceSource();
+        }
+        // REVISION (finding 21a2b135): having code is not the same as answering. A source that
+        // reverts on, or returns short words from, the two reads reserveValueOf makes would have
+        // made reserveValueUsd — and so the vault's work ceiling and every earn — revert
+        // until a delisting matured 48 hours later. Probe both reads here, where the listing fails
+        // instead, with the same leniency a typed call applies to the returned length.
+        // AUDIT FIX (job da7d5b1c, medium): the length alone is not the encoding. This used to probe
+        // "with the same leniency a typed call applies to the returned length", which let a source
+        // answering 2 for a bool, or a timestamp above uint64, pass the listing and then be refused
+        // at valuation. Both layers now agree on what a well-formed answer is: refuse it here, where
+        // the proposal fails for free, AND count it for nothing there, where reverting is not allowed.
+        (bool stale, bool ok) = _readBool(priceFeed, abi.encodeCall(ISwarmFeed.isStale, ()));
+        stale; // staleness at listing time is not disqualifying; only a malformed answer is.
+        if (!ok) revert InvalidPriceSource();
+        (, bool priced) = _readValue(priceFeed);
+        if (!priced) revert InvalidPriceSource();
+        // Both endpoints are valid: zero backing through full market value.
+        if (haircutBps > BPS) revert HaircutOutOfRange(haircutBps);
+        // Reverts here if the token has no decimals(), which is also what prices it correctly later.
+        // Same finding: 10 ** 78 overflows, so a token claiming more places than that would turn
+        // every later valuation into a panic. No real token is near this.
+        if (IERC20Metadata(address(asset)).decimals() > 77) revert InvalidReserveAsset();
+    }
+
+    /// @notice List, reprice or (with a zero price source) delist a reserve asset. Registrar only,
+    /// which is the vault's Parameters contract applying a matured proposal.
+    function setReserveAsset(IERC20 asset, ISwarmFeed priceFeed, uint256 haircutBps) external {
+        address governor = registrar();
+        if (governor == address(0) || msg.sender != governor) revert Unauthorized();
+        validateReserveAsset(asset, priceFeed, haircutBps);
+        if (address(priceFeed) == address(0)) {
+            _remove(asset);
+            emit ReserveAssetRemoved(asset);
+            return;
+        }
+        if (!isReserveAsset(asset)) _reserveAssets.push(asset);
+        uint8 places = address(asset) == _linked(abi.encodeWithSignature("gem()"))
+            ? 18
+            : IERC20Metadata(address(asset)).decimals();
+        _reserve[asset] = ReserveAsset(priceFeed, haircutBps, places);
+        emit ReserveAssetSet(asset, priceFeed, haircutBps);
+    }
+
+    /// @notice What the reserve is worth, in USD scaled by 1e18: the sum over registered assets of
+    /// balance x price x haircutBps / 10000, normalized by the token's decimals.
+    /// @dev An asset whose price source is stale or reads zero counts for nothing. A dead feed can
+    /// therefore only tighten the ceiling that reads this; it can never inflate it, and it never
+    /// makes this view revert.
+    function reserveValueUsd() public view returns (uint256 total) {
+        uint256 count = _reserveAssets.length;
+        for (uint256 i; i < count; ++i) {
+            // Saturating: several enormous listings must not revert the sum either.
+            (bool ok, uint256 next) = Math.tryAdd(total, reserveValueOf(_reserveAssets[i]));
+            total = ok ? next : type(uint256).max;
+        }
+    }
+
+    /// @notice One asset's discounted USD value; zero for anything unlisted or unpriced.
+    /// @dev The two feed reads are wrapped so a source that passed validation and later stops
+    /// answering counts for nothing, which is the promise reserveValueUsd makes, rather than
+    /// reverting the vault's ceiling until a delisting matures.
+    function reserveValueOf(IERC20 asset) public view returns (uint256) {
+        uint256 price = _reservePrice(asset);
+        if (price == 0) return 0;
+        (uint256 balance, bool held) = _readBalance(asset);
+        if (!held || balance == 0) return 0;
+        ReserveAsset storage entry = _reserve[asset];
+        // A value whose USD figure does not fit in 256 bits is a broken source, not a reserve: counted for
+        // nothing, as promised, rather than reverting the sum and everything that reads it (launch audit,
+        // governance panel). Exact: balance * price / 10**decimals overflows only when balance exceeds
+        // one whole token AND price exceeds max * 10**decimals / balance.
+        uint256 unit = 10 ** entry.decimals;
+        if (balance > unit && price > Math.mulDiv(type(uint256).max, unit, balance)) return 0;
+        uint256 value = Math.mulDiv(Math.mulDiv(balance, price, unit), entry.haircutBps, BPS);
+        // A value that fits in 256 bits can still overflow the vault's sums that add to it (earnLine,
+        // backingPerUnit, the redemption backing): anything above $1e18 is a broken source, not a
+        // reserve, and counts for nothing (adversarial review 2026-10-05, low).
+        return value > MAX_RESERVE_VALUE ? 0 : value;
+    }
+
+    function _reservePrice(IERC20 asset) private view returns (uint256) {
+        ReserveAsset storage entry = _reserve[asset];
+        if (address(entry.priceFeed) == address(0)) return 0;
+        // AUDIT FIX (job da7d5b1c, two mediums): every one of these three reads is a raw staticcall
+        // with its own decoding, because try/catch DOES NOT COVER DECODING. `try` catches a revert
+        // inside the callee; the returned bytes are decoded in THIS frame, and a bad encoding panics
+        // here where no catch clause can see it. A listed feed answering `abi.encode(uint256(2))` for
+        // a bool, or one word for `(uint256,uint64)`, therefore reverted reserveValueUsd() — and with
+        // it earnLine() and every earn — rather than counting for nothing. The third read
+        // is balanceOf, which was never isolated at all: a token that stops answering balances took
+        // the whole reserve sum down with it, including unrelated healthy assets.
+        (bool stale, bool ok) = _readBool(entry.priceFeed, abi.encodeCall(ISwarmFeed.isStale, ()));
+        if (!ok || stale) return 0;
+        (uint256 price, bool priced) = _readValue(entry.priceFeed);
+        return priced ? price : 0;
+    }
+
+    /// @dev A word that is a valid ABI bool is exactly 0 or 1. Anything else is not a bool, and the
+    /// caller treats "not a bool" the same as "no answer": this asset counts for nothing.
+    function _readBool(ISwarmFeed feed, bytes memory call) private view returns (bool value, bool ok) {
+        (bool success, uint256 word,) = _boundedCall(address(feed), call);
+        if (!success) return (false, false);
+        if (word > 1) return (false, false);
+        return (word == 1, true);
+    }
+
+    /// @dev A staticcall that copies at most the two words a reserve read needs. The `(bool, bytes)`
+    /// form copies ALL the callee's returndata into this frame before any length check, so a listed feed
+    /// or token answering megabytes made the copy itself run out of gas and reverted reserveValueUsd, and
+    /// with it earnLine, earn, backingPerUnit and every cash, for the two days a delisting takes (final
+    /// panel audit, governance, low). Here the copy is fixed-size; `success` is false when the call failed
+    /// or returned fewer than 32 bytes, and `second` is meaningful only when 64 or more came back. The call
+    /// gets at most RESERVE_READ_GAS: forwarded everything, one listed source that burned what it was given
+    /// put a multi-million-gas floor under every cash, earn and backingPerUnit, and three such listings
+    /// made the sum itself run out of gas (sweep panel audit, governance, low). A healthy read is a few
+    /// thousand gas; SharePriceFeed, the heaviest shipped source, well under a hundred thousand.
+    function _boundedCall(address target, bytes memory data)
+        private
+        view
+        returns (bool success, uint256 first, uint256 second)
+    {
+        uint256 size;
+        assembly ("memory-safe") {
+            let out := mload(0x40)
+            success := staticcall(RESERVE_READ_GAS, target, add(data, 32), mload(data), out, 64)
+            size := returndatasize()
+            first := mload(out)
+            second := mload(add(out, 32))
+        }
+        if (size < 32) success = false;
+        if (size < 64) second = type(uint256).max;
+    }
+
+    /// @dev `(uint256, uint64)`: two words, the second of which must actually fit in uint64. The
+    /// timestamp is discarded — staleness is the feed's own answer — but a word that cannot be a
+    /// uint64 means the response is not the tuple it claims to be, so it is refused wholesale.
+    function _readValue(ISwarmFeed feed) private view returns (uint256 value, bool ok) {
+        (bool success, uint256 first, uint256 second) =
+            _boundedCall(address(feed), abi.encodeCall(ISwarmFeed.latestValue, ()));
+        // Fewer than two words reads `second` as max, which is not a uint64: refused like any malformed tuple.
+        if (!success || second > type(uint64).max) return (0, false);
+        return (first, true);
+    }
+
+    function _readBalance(IERC20 asset) private view returns (uint256 balance, bool ok) {
+        (bool success, uint256 first,) = _boundedCall(address(asset), abi.encodeCall(IERC20.balanceOf, (address(this))));
+        if (!success) return (0, false);
+        return (first, true);
+    }
+
+    function _remove(IERC20 asset) private {
+        uint256 count = _reserveAssets.length;
+        for (uint256 i; i < count; ++i) {
+            if (_reserveAssets[i] != asset) continue;
+            _reserveAssets[i] = _reserveAssets[count - 1];
+            _reserveAssets.pop();
+            break;
+        }
+        delete _reserve[asset];
+    }
+
+    /// @dev An address the creating vault exposes, or zero if it exposes nothing of the kind. A
+    /// staticcall so a Treasury created by something that is not a vault still answers its views.
+    function _linked(bytes memory probe) private view returns (address) {
+        (bool ok, bytes memory data) = vault.staticcall(probe);
+        if (!ok || data.length != 32) return address(0);
+        uint256 word = abi.decode(data, (uint256));
+        return word > type(uint160).max ? address(0) : address(uint160(word));
+    }
+
+    // --- revenue --------------------------------------------------------------------------------
+
+    /// @notice Record anything that has arrived since the last call. Callable by anyone.
+    /// @return credited The amount added to this token's running total.
+    function sync(IERC20 token) external returns (uint256 credited) {
+        uint256 balance = token.balanceOf(address(this));
+        uint256 counted = lastSynced[token];
+        // A withdrawal lowers the balance below what was counted. That is not a loss of revenue, so
+        // the running total holds and only the baseline moves.
+        if (balance <= counted) {
+            lastSynced[token] = balance;
+            return 0;
+        }
+        credited = balance - counted;
+        lastSynced[token] = balance;
+        totalReceived[token] += credited;
+        emit Received(token, credited, totalReceived[token]);
+    }
+
+    /// @notice The only account that may withdraw. A source constant, like every authority here.
+    function withdrawer() external pure returns (address) {
+        return APPROVED_OPERATOR;
+    }
+
+    /// @notice Move funds out, to a destination the caller names. Operator only.
+    /// @dev Pinned to APPROVED_OPERATOR in source, like every other authority in this protocol, so a
+    /// deployment template cannot substitute it. The destination is an argument rather than a second
+    /// constant because the point of holding revenue is to deploy it later (governor-run LP, say).
+    /// @dev Two things the operator cannot take, whatever the destination:
+    ///   - the reserve: any listed reserve asset, and the vault's collateral token (sIMD), which pays
+    ///     redemptions first whether or not it is listed. Removing backing takes a delisting through
+    ///     Parameters, visible for 48 hours, and the collateral can never be withdrawn here at all;
+    ///   - the imdUSD that realized bad debt still needs. The operator may withdraw imdUSD (to provide
+    ///     liquidity, say) only down to the vault's outstanding totalBadDebt, so `cover` comes first.
+    function withdraw(IERC20 token, address to, uint256 amount) external nonReentrant {
+        if (msg.sender != APPROVED_OPERATOR) revert Unauthorized();
+        if (address(token) == _linked(abi.encodeWithSignature("gem()")) || isReserveAsset(token)) {
+            revert ReserveProtected(token);
+        }
+        if (address(token) == _linked(abi.encodeWithSignature("stablecoin()"))) {
+            uint256 owed = _badDebt();
+            uint256 balance = token.balanceOf(address(this));
+            if (balance < amount || balance - amount < owed) revert BadDebtFirst(owed);
+        }
+        _withdraw(token, to, amount);
+    }
+
+    // --- the operator stream ------------------------------------------------------------------
+
+    /// @notice The UTC day `streamPaid` counts, and the imdUSD the stream has paid within it.
+    uint256 public streamDay;
+    uint256 public streamPaid;
+
+    /// @notice Pay the governed payee what remains of today's stream, in imdUSD. Anyone may call it.
+    /// @dev The payee and the daily amount are `Parameters.streamPayee` / `streamPerDay`, changeable
+    /// only behind the 48-hour timelock and hard-capped there. A day not claimed is not carried over.
+    /// Like `withdraw`, it never spends imdUSD that outstanding bad debt still needs.
+    /// @return paid imdUSD sent by this call; zero once today's amount is paid or nothing is spare.
+    function payStream() external nonReentrant returns (uint256 paid) {
+        address parameters = _linked(abi.encodeWithSignature("parameters()"));
+        IERC20 token = IERC20(_linked(abi.encodeWithSignature("stablecoin()")));
+        if (parameters == address(0) || address(token) == address(0)) revert NoStream();
+        address payee = abi.decode(_read(parameters, abi.encodeWithSignature("streamPayee()")), (address));
+        uint256 perDay = abi.decode(_read(parameters, abi.encodeWithSignature("streamPerDay()")), (uint256));
+        if (payee == address(0) || perDay == 0) revert NoStream();
+        uint256 day = block.timestamp / 1 days;
+        if (day != streamDay) {
+            streamDay = day;
+            streamPaid = 0;
+        }
+        if (perDay <= streamPaid) return 0;
+        uint256 balance = token.balanceOf(address(this));
+        uint256 owed = _badDebt();
+        uint256 spare = balance > owed ? balance - owed : 0;
+        paid = Math.min(perDay - streamPaid, spare);
+        if (paid == 0) return 0;
+        streamPaid += paid;
+        _withdraw(token, payee, paid);
+        emit StreamPaid(payee, paid, streamPaid);
+    }
+
+    /// @dev The vault's realized, uncovered bad debt; zero for a Treasury no vault stands behind.
+    function _badDebt() private view returns (uint256) {
+        (bool ok, bytes memory data) = vault.staticcall(abi.encodeWithSignature("totalBadDebt()"));
+        return ok && data.length == 32 ? abi.decode(data, (uint256)) : 0;
+    }
+
+    function _read(address target, bytes memory call) private view returns (bytes memory data) {
+        bool ok;
+        (ok, data) = target.staticcall(call);
+        if (!ok || data.length != 32) revert NoStream();
+    }
+
+    // --- native ETH -----------------------------------------------------------------------------
+
+    /// @notice Accept ETH from anyone. Deliberately empty: a payer forwarding only a stipend still
+    /// succeeds, and ETH that arrives without calling this at all (a forced send) is recorded the
+    /// same way, by `syncNative`.
+    receive() external payable {}
+
+    /// @notice Record any ETH that has arrived since the last call. Callable by anyone.
+    /// @return credited The amount added to the native running total.
+    function syncNative() external returns (uint256 credited) {
+        uint256 balance = address(this).balance;
+        uint256 counted = lastSynced[NATIVE];
+        if (balance <= counted) {
+            lastSynced[NATIVE] = balance;
+            return 0;
+        }
+        credited = balance - counted;
+        lastSynced[NATIVE] = balance;
+        totalReceived[NATIVE] += credited;
+        emit Received(NATIVE, credited, totalReceived[NATIVE]);
+    }
+
+    /// @notice Move ETH out, to a destination the operator names. The same authority and the same
+    /// accounting order as `withdraw`: credit the unsynced arrival, move the baseline, then transfer,
+    /// so a recipient re-entering `syncNative` during the call credits nothing twice.
+    function withdrawNative(address payable to, uint256 amount) external nonReentrant {
+        if (msg.sender != APPROVED_OPERATOR) revert Unauthorized();
+        if (to == address(0) || to == address(this)) revert InvalidRecipient();
+        if (amount == 0) revert ZeroAmount();
+        uint256 before = address(this).balance;
+        uint256 counted = lastSynced[NATIVE];
+        if (before > counted) {
+            uint256 credited = before - counted;
+            totalReceived[NATIVE] += credited;
+            emit Received(NATIVE, credited, totalReceived[NATIVE]);
+        }
+        lastSynced[NATIVE] = before > amount ? before - amount : 0;
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert NativeTransferFailed();
+        uint256 remaining = address(this).balance;
+        if (remaining < lastSynced[NATIVE]) lastSynced[NATIVE] = remaining;
+        emit Withdrawn(NATIVE, to, amount);
+    }
+
+    // --- launch fee share ---------------------------------------------------------------------
+
+    /// @notice Hand this Treasury's share of a launch pool's future LP fees to another address.
+    /// @dev A launch factory pays its requester's share to whoever `setRequester` last named, and only
+    /// that address may name the next one. Without this function, naming the Treasury would be
+    /// permanent: it could receive the fees but never move the role on. Operator-only, the same
+    /// authority as `withdraw`, because it redirects revenue. It moves only FUTURE fees; anything
+    /// already paid or owed stays here. The factory is the pinned LAUNCH_FACTORY, never an argument.
+    function handOffLaunchFees(uint64 launchNumber, address next) external {
+        if (msg.sender != APPROVED_OPERATOR) revert Unauthorized();
+        if (next == address(0) || next == address(this)) revert InvalidRecipient();
+        ILaunchFeeShare(LAUNCH_FACTORY).setRequester(launchNumber, next);
+        emit LaunchFeesHandedOff(LAUNCH_FACTORY, launchNumber, next);
+    }
+
+    // --- the oracle budget ----------------------------------------------------------------------
+
+    /// @notice The UTC day `oracleSpent` counts, and the IMD sent to the oracle asker within it.
+    uint256 public oracleDay;
+    uint256 public oracleSpent;
+
+    /// @notice Send the oracle asker what is left of today's budget, in IMD. Anyone may call it.
+    /// @dev One of the Treasury's keyless exits, with `payStream`, `redeemIMD` (vault only) and the
+    /// vault's `cover` burn. It tops the asker up to one day's budget rather than adding a full day's
+    /// worth whatever it already holds, because the asker has no way to return IMD. The
+    /// destination is a source constant, the amount is capped per UTC day by the vault's governed
+    /// `Parameters.oracleBudget`, and the token is the collateral's. When the collateral is a share
+    /// (sIMD), the IMD is WITHDRAWN from the share vault straight to the asker, so the asker holds the
+    /// asset the Intake is paid in and never touches shares; IMD the Treasury holds directly (and has not
+    /// listed as a reserve asset) is spent before any share is unwrapped. sIMD's one-block hold applies: shares that
+    /// arrived in this block cannot be withdrawn in it, so right after a liquidation the unwrap is caught and
+    /// the call sends only the plain IMD (or nothing); a block later the shares unwrap. Refuses an asker with no code, so a placeholder constant fails loudly.
+    /// @return sent IMD sent to the asker by this call; zero once today's budget is spent.
+    function fundOracle() external nonReentrant returns (uint256 sent) {
+        if (ORACLE_ASKER.code.length == 0) revert OracleAskerMissing();
+        address token = _linked(abi.encodeWithSignature("gem()"));
+        if (token == address(0)) revert InvalidReserveAsset();
+        uint256 day = block.timestamp / 1 days;
+        if (day != oracleDay) {
+            oracleDay = day;
+            oracleSpent = 0;
+        }
+        uint256 budget = _oracleBudget();
+        if (budget <= oracleSpent) return 0;
+        uint256 want = budget - oracleSpent;
+        bool share = _isShare(token);
+        // Top up, never pile up (launch audit, oracle panel, medium): the asker has no way to return
+        // IMD, so it is sent at most what brings its balance to one day's budget. Unspent budget stays
+        // here, in the reserve, instead of accumulating in a contract nothing can withdraw from.
+        address imd = share ? IShareVault(token).asset() : token;
+        uint256 held = IERC20(imd).balanceOf(ORACLE_ASKER);
+        uint256 room = budget > held ? budget - held : 0;
+        if (room < want) want = room;
+        if (want == 0) return 0;
+        // With a share collateral, IMD the Treasury holds as itself (launch-pool fees through
+        // handOffLaunchFees, donations) is spent first, then shares are unwrapped. Shares alone left the
+        // oracle unfunded however much plain IMD revenue arrived, while the runbook said that revenue took
+        // over from the keeper (final panel audit, governance, low). Plain IMD that is a LISTED reserve
+        // asset stays protected, as it is from the operator's withdraw.
+        uint256 plain;
+        if (share && !isReserveAsset(IERC20(imd))) {
+            plain = IERC20(imd).balanceOf(address(this));
+            if (plain > want) plain = want;
+        }
+        uint256 fromShares;
+        if (plain < want) {
+            uint256 available =
+                share ? IShareVault(token).maxWithdraw(address(this)) : IERC20(token).balanceOf(address(this));
+            fromShares = want - plain < available ? want - plain : available;
+        }
+        if (plain + fromShares == 0) return 0;
+        if (plain != 0) _withdraw(IERC20(imd), ORACLE_ASKER, plain);
+        if (fromShares != 0) {
+            if (!share) {
+                _withdraw(IERC20(token), ORACLE_ASKER, fromShares);
+            } else {
+                // Best effort: sIMD refuses a withdrawal in any block the Treasury received shares (its
+                // same-block hold), and that must not take the plain IMD already sent with it, or anyone
+                // sending one raw share unit a block could hold the oracle's funding off (sweep panel
+                // audit, governance, info). An external self-call, so the unwrap's revert is caught, with a
+                // fixed stipend it must be given in full (UNWRAP_GAS): refused outright when the caller
+                // brought less, so an estimated gas limit cannot starve it.
+                uint256 needed = UNWRAP_GAS + UNWRAP_GAS / 63 + 30_000;
+                if (gasleft() < needed) revert InsufficientGasForUnwrap(needed, gasleft());
+                try this.unwrapForOracle{gas: UNWRAP_GAS}(IERC20(token), fromShares) {}
+                catch {
+                    fromShares = 0;
+                }
+            }
+        }
+        sent = plain + fromShares;
+        if (sent == 0) return 0;
+        oracleSpent += sent;
+        emit OracleFunded(ORACLE_ASKER, sent, oracleSpent);
+    }
+
+    /// @dev The vault's governed budget, or zero when nothing answers: a Treasury with no Parameters
+    /// behind it streams nothing.
+    function _oracleBudget() private view returns (uint256) {
+        address parameters = _linked(abi.encodeWithSignature("parameters()"));
+        if (parameters == address(0)) return 0;
+        (bool ok, bytes memory data) = parameters.staticcall(abi.encodeWithSignature("oracleBudget()"));
+        if (!ok || data.length != 32) return 0;
+        return abi.decode(data, (uint256));
+    }
+
+    function _isShare(address token) private view returns (bool) {
+        (bool ok, bytes memory data) = token.staticcall(abi.encodeCall(IShareVault.asset, ()));
+        return ok && data.length == 32 && abi.decode(data, (address)) != address(0);
+    }
+
+    /// @notice `fundOracle`'s share leg, callable only by this contract (so a refused unwrap can be caught).
+    function unwrapForOracle(IERC20 shares, uint256 assets) external {
+        if (msg.sender != address(this)) revert InvalidRecipient();
+        _withdrawUnderlying(shares, assets);
+    }
+
+    /// @dev `_withdraw`'s accounting for a share token whose UNDERLYING leaves: credit what arrived
+    /// since the last sync, move the baseline before the external call, re-derive it afterwards.
+    function _withdrawUnderlying(IERC20 shares, uint256 assets) private {
+        uint256 before = shares.balanceOf(address(this));
+        uint256 counted = lastSynced[shares];
+        if (before > counted) {
+            uint256 credited = before - counted;
+            totalReceived[shares] += credited;
+            emit Received(shares, credited, totalReceived[shares]);
+        }
+        // Baseline at the credited balance BEFORE the call: shares only leave, so a `sync` re-entered
+        // during the withdraw sees no more than this and credits nothing (the double-credit that audit
+        // job da7d5b1c found in `_withdraw` cannot recur here).
+        lastSynced[shares] = before;
+        IShareVault(address(shares)).withdraw(assets, ORACLE_ASKER, address(this));
+        uint256 remaining = shares.balanceOf(address(this));
+        lastSynced[shares] = remaining;
+        emit Withdrawn(shares, ORACLE_ASKER, before - remaining);
+    }
+
+    /// @notice Release reserve collateral for a redemption priced and burned by this Treasury's vault.
+    /// @dev Neither the caller nor governance can select another reserve asset through this path.
+    function redeemIMD(address to, uint256 amount) external nonReentrant {
+        if (msg.sender != vault) revert Unauthorized();
+        address token = _linked(abi.encodeWithSignature("gem()"));
+        if (token == address(0)) revert InvalidReserveAsset();
+        _withdraw(IERC20(token), to, amount);
+    }
+
+    function _withdraw(IERC20 token, address to, uint256 amount) private {
+        if (to == address(0) || to == address(this)) revert InvalidRecipient();
+        if (amount == 0) revert ZeroAmount();
+        // AUDIT FIX (job c71449d1, low): credit anything that arrived since the last sync BEFORE
+        // moving the baseline. Clamping first silently dropped that revenue from totalReceived
+        // forever — no funds lost, but the one number this contract exists to answer was wrong.
+        uint256 before = token.balanceOf(address(this));
+        uint256 counted = lastSynced[token];
+        if (before > counted) {
+            uint256 credited = before - counted;
+            totalReceived[token] += credited;
+            emit Received(token, credited, totalReceived[token]);
+        }
+        // AUDIT FIX (job da7d5b1c, low): move the baseline BEFORE the transfer. Crediting first and
+        // clamping afterwards left the old baseline visible for the length of an external call, so a
+        // recipient callback calling permissionless `sync` credited the remaining balance a second
+        // time. The record is this contract's whole purpose, so a reentrant double-credit corrupts
+        // the one number it answers. Setting it to the post-transfer balance up front is exact for a
+        // well-behaved token and is re-derived below for one that moves a different amount.
+        lastSynced[token] = before > amount ? before - amount : 0;
+        token.safeTransfer(to, amount);
+        // Fee-on-transfer and rebasing tokens do not move exactly `amount`. Re-reading closes that
+        // gap; a callback during the transfer has already seen the conservative baseline above, so it
+        // can credit at most what genuinely arrived.
+        uint256 remaining = token.balanceOf(address(this));
+        if (remaining < lastSynced[token]) lastSynced[token] = remaining;
+        emit Withdrawn(token, to, amount);
+    }
+}
