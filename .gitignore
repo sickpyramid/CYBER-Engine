@@ -18,3 +18,5 @@ models/
 
 # secrets
 .env
+
+data/workdir/

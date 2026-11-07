@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """CyberAgent engine CLI.  Usage:
-    python cli.py ingest defihacklabs        # parse the cloned corpus into data/corpus.sqlite
-    python cli.py stats                       # show corpus summary
-    python cli.py detect <chain> <address>    # fetch verified source + run detection substrate
-    python cli.py scoreboard [N]              # held-out rediscovery eval over N corpus cases
+    python cli.py hunt <chain> <address> [block]  # SKILL entrypoint: brief for an agent to write+prove a PoC
+    python cli.py prove <workdir|poc.sol>         # run the agent's PoC on a mainnet fork -> proven?
+    python cli.py detect <chain> <address>        # static (Slither) findings only
+    python cli.py scoreboard [N]                  # held-out rediscovery eval over N corpus cases
+    python cli.py ingest defihacklabs             # (re)build data/corpus.sqlite from DeFiHackLabs
+    python cli.py stats                           # corpus summary
+
+hunt + prove need no LLM key — the driving agent is the synthesizer. See SKILL.md.
 """
 import sys, json
 from pathlib import Path
@@ -65,6 +69,64 @@ def cmd_scoreboard(n):
     from training import eval_holdout
     eval_holdout.evaluate(limit=int(n) if n else None)
 
+CHAIN_ALIAS = {"ethereum": "mainnet", "bsc": "bsc", "polygon": "polygon",
+               "arbitrum": "arbitrum", "optimism": "optimism", "base": "base"}
+
+def cmd_hunt(chain, address, block=None):
+    """Skill entrypoint: prep everything an agent needs to write + prove a PoC.
+    No LLM key needed — the DRIVING agent is the synthesizer."""
+    from engine import fetch_source, mechanism, retrieval
+    con = db.connect()
+    if block is None:
+        r = con.execute("SELECT block_number FROM attacks WHERE chain=? AND lower(victim_addrs) LIKE ?",
+                        (chain, f'%{address.lower()}%')).fetchone()
+        block = r["block_number"] if r and r["block_number"] else None
+    work = HERE / "data" / "workdir" / f"{chain}_{address[:10]}"
+    (work / "examples").mkdir(parents=True, exist_ok=True)
+    meta = fetch_source.fetch(chain, address, str(work))
+    if not meta or not meta.get("source_keys"):
+        print(json.dumps({"ok": False, "reason": "no verified source on Sourcify"})); return
+    src = ""
+    for k in meta["source_keys"]:
+        p = Path(meta["src_root"]) / k
+        if p.exists(): src += f"\n// ===== FILE: {k} =====\n" + p.read_text(errors="replace")
+    (work / "SOURCE.sol").write_text(src)
+    mech = mechanism.analyze(meta["src_root"], meta["source_keys"], meta.get("solc"), meta.get("remappings"))
+    ex = retrieval.retrieve_for_target(con, mech, chain=chain, k=4)
+    ex_paths = []
+    for e in ex:
+        ep = work / "examples" / f"{e['name'][:30].replace('/','_')}.sol"
+        ep.write_text(f"// {e['name']} | {e['vuln_class']} | {e['chain']} | block {e['block_number']}\n" + e["poc_code"])
+        ex_paths.append(str(ep))
+    brief = {
+        "target": {"chain": chain, "address": address, "fork_alias": CHAIN_ALIAS.get(chain, chain),
+                   "block": block, "contract": meta["contract"], "solc": meta["solc"]},
+        "mechanism": {"archetypes": mech.get("archetypes"),
+                      "predicted_classes": mech.get("predicted_classes"),
+                      "top_hypotheses": mech.get("hypotheses", [])[:3]},
+        "source_file": str(work / "SOURCE.sol"),
+        "example_pocs": ex_paths,
+        "write_poc_to": str(work / "attempt.sol"),
+        "then_run": f"python cli.py prove {work}",
+    }
+    (work / "brief.json").write_text(json.dumps(brief, indent=1))
+    print(json.dumps(brief, indent=1))
+
+def cmd_prove(path):
+    """Prove the agent-written PoC on a mainnet fork. `path` = the attempt.sol or its workdir."""
+    import shutil
+    from engine import prover
+    p = Path(path)
+    poc = p / "attempt.sol" if p.is_dir() else p
+    if not poc.exists():
+        print(json.dumps({"ok": False, "reason": f"no PoC at {poc}"})); return
+    gen = VENDOR / "DeFiHackLabs" / "src" / "test" / "_generated"
+    gen.mkdir(parents=True, exist_ok=True)
+    dst = gen / f"Attempt_{poc.parent.name}.sol"
+    shutil.copy2(poc, dst)
+    res = prover.prove(dst.relative_to(VENDOR / "DeFiHackLabs").as_posix(), VENDOR / "DeFiHackLabs")
+    print(json.dumps(res, indent=1))
+
 if __name__ == "__main__":
     if len(sys.argv) < 2: print(__doc__); sys.exit(1)
     cmd = sys.argv[1]
@@ -72,4 +134,6 @@ if __name__ == "__main__":
     elif cmd == "stats": cmd_stats()
     elif cmd == "detect": cmd_detect(sys.argv[2], sys.argv[3])
     elif cmd == "scoreboard": cmd_scoreboard(sys.argv[2] if len(sys.argv) > 2 else None)
+    elif cmd == "hunt": cmd_hunt(sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else None)
+    elif cmd == "prove": cmd_prove(sys.argv[2])
     else: print("unknown:", cmd); print(__doc__)
