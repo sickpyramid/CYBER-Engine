@@ -24,20 +24,33 @@ fork at the historical block. Success = a measured, climbing rediscovery rate, P
 | 3. Mechanism reasoning | `engine/mechanism.py` | ✅ | 0%→43% on oracle/flashloan/proxy (the classes static analysis can't see) |
 | 4. Exploit validation | `engine/prover.py` | ✅ | 6/8 historical exploits re-proven on fork; real drains confirmed |
 
-## What's being built now: the CREATIVE LOOP (tiers 5–6)
+## The CREATIVE LOOP (built) — two ways to run it
+
 ```
 held-out contract → mechanism.hypotheses() → retrieve similar historical attacks (RAG)
-   → LLM synthesizes a Foundry PoC for the top hypothesis
-      → prover.prove() runs it on the fork
-         → drained? PROVEN.  failed? feed the trace back, refine, retry.  ← relentless
+   → synthesize a Foundry PoC → prover.prove() on the fork
+      → drained? PROVEN.  failed? feed the forge error back, refine, retry.  ← relentless
 ```
-- `engine/retrieval.py` — RAG over the 920 attacks (find similar prior attacks to combine). [building]
-- `engine/synthesize.py` — PoC synthesis; pluggable LLM backend (Anthropic API default). [building]
-- `engine/creative_loop.py` — the orchestrator that wires it + the refine loop. [building]
+
+**A. As a SKILL (no API key — the driving agent is the synthesizer). PREFERRED.**
+See `SKILL.md` (also `.claude/skills/cyber-hunt/`). Flow:
+```bash
+python cli.py hunt <chain> <address> [block]   # brief: source + hypotheses + example PoCs
+# agent reads SOURCE.sol + example_pocs, writes data/workdir/<..>/attempt.sol
+python cli.py prove data/workdir/<..>          # runs it on the fork -> proven?/error -> refine
+```
+- `engine/retrieval.py` — RAG over the corpus (similar attacks as building blocks). ✅
+- `engine/prover.py` — fork-replay validation. ✅
+
+**B. Fully automated (needs an LLM API key).**
+`engine/synthesize.py` (Anthropic default, `ANTHROPIC_API_KEY`) + `engine/creative_loop.py`:
+```bash
+python engine/creative_loop.py <chain> <address> [block] [attempts]
+```
 
 **Why it matters:** tiers 2–3 *recognize* known shapes; they can't invent. The creative
-loop is the part that generates NOVEL / COMBINED attacks, and the prover (tier 4) is the
-feedback signal that keeps curiosity honest (a hypothesis is a hallucination until it drains).
+loop is where NOVEL / COMBINED attacks come from, and the prover is the feedback signal
+that keeps curiosity honest (a hypothesis is a hallucination until it drains).
 
 ## Setup / credentials
 - Python deps: `pip install -r requirements.txt` (slither-analyzer, solc-select, requests).
