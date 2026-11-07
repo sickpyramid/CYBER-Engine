@@ -20,3 +20,7 @@ models/
 .env
 
 data/workdir/
+
+examples/*/lib/
+examples/*/out/
+examples/*/cache/
