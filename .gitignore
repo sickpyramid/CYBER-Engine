@@ -15,3 +15,6 @@ training/out/
 models/
 
 # keep the shipped corpus db tracked (do NOT ignore data/corpus.sqlite)
+
+# secrets
+.env

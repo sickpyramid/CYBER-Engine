@@ -36,12 +36,12 @@ def _ensure_solc(version: str | None):
     if not version:
         return
     env = dict(os.environ, PATH=f"{Path.home()/'.local/bin'}:{os.environ.get('PATH','')}")
-    subprocess.run(["solc-select", "use", version], capture_output=True, env=env, timeout=120)
-    # install on demand if 'use' failed
-    r = subprocess.run(["solc", "--version"], capture_output=True, env=env, timeout=30)
-    if version.split(".")[1] not in r.stdout.decode(errors="replace"):
+    # Parallel-safe: ensure the version is installed, then select it per-process via
+    # SOLC_VERSION (solc-select's shim honours it) instead of the global `use` symlink.
+    artifacts = Path.home() / ".solc-select" / "artifacts" / f"solc-{version}"
+    if not artifacts.exists():
         subprocess.run(["solc-select", "install", version], capture_output=True, env=env, timeout=400)
-        subprocess.run(["solc-select", "use", version], capture_output=True, env=env, timeout=120)
+    os.environ["SOLC_VERSION"] = version
 
 
 def analyze(src_root: str, source_keys: list[str], solc: str | None = None) -> dict:

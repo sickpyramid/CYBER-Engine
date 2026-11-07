@@ -101,10 +101,55 @@ _CLASSIFIERS = [
 
 
 def classify(text: str) -> tuple[str, str]:
-    """Return (slug, matched_raw). Cheap keyword pass; refined later by the LLM step."""
+    """Return (slug, matched_raw). Cheap keyword pass over header/name text."""
     t = (text or "").lower()
     for slug, pat in _CLASSIFIERS:
         m = re.search(pat, t)
         if m:
             return slug, m.group(0)
+    return "other", ""
+
+
+# High-precision signals read from the actual exploit CODE (what the attacker DOES).
+# Scored and weighted; strongest signal wins. Collapses most of the header-only "other".
+_CODE_SIGNALS = [
+    # (slug, weight, regex over poc code)
+    ("flashloan_assisted", 3, r"flashloan|flash_?loan|flashswap|uniswapv2call|uniswapv3flashcallback"
+                              r"|receiveflashloan|executeoperation|pancakecall|dppflashloancall|flashfrom"),
+    ("price_oracle_manip", 3, r"getreserves|\.slot0|getamountsout|latestanswer|get_?price|consult\("
+                              r"|\.sync\(\)|\.skim\(|price_?cumulative|getunderlyingprice|peek\(|latestrounddata"),
+    ("reentrancy",         3, r"onerc721received|onerc1155received|tokensreceived|\.call\{value"
+                              r"|fallback\(\)\s*external|receive\(\)\s*external|reentr"),
+    ("signature_replay",   3, r"ecrecover|\.permit\(|splitsignature|v,\s*r,\s*s|_hashtypeddata|domipseparator"),
+    ("unchecked_external", 2, r"delegatecall|\.functioncall|low-?level call|\.call\(abi|arbitrary"),
+    ("first_depositor",    3, r"totalsupply\(\)\s*==\s*0|first deposit|share inflation|inflation attack|_mint\(address\(1\)"),
+    ("proxy_upgrade",      2, r"upgradeto|initialize\(|__init|implementation\(\)|storage slot|erc1967"),
+    ("governance",         2, r"propose\(|castvote|execute\(uint|timelock|quorum|delegate\("),
+    ("bridge",             2, r"\bbridge\b|relaymessage|processmessage|verifyproof|merkleproof|claimrewards?\(bytes"),
+    ("access_control",     2, r"selfdestruct|transferownership|onlyowner|setowner|\.mint\(|grantrole"),
+    ("arithmetic",         1, r"overflow|underflow|unchecked\s*\{|type\(uint\d*\)\.max|/\s*0|rounding"),
+]
+_CODE_COMPILED = [(slug, w, re.compile(pat, re.I)) for slug, w, pat in _CODE_SIGNALS]
+
+
+def classify_attack(header: str, name: str, code: str) -> tuple[str, str]:
+    """Layered classifier: header keywords first (explicit), then weighted CODE signals.
+
+    The exploit code is the strongest evidence of the attack mechanism, so when the
+    header is silent we score the PoC body and take the highest-weighted hit.
+    """
+    slug, raw = classify(f"{header} {name}")
+    if slug != "other":
+        return slug, raw
+    scores: dict[str, int] = {}
+    hits: dict[str, str] = {}
+    body = code or ""
+    for s, w, rx in _CODE_COMPILED:
+        m = rx.search(body)
+        if m:
+            scores[s] = scores.get(s, 0) + w
+            hits.setdefault(s, m.group(0)[:40])
+    if scores:
+        best = max(scores, key=scores.get)
+        return best, hits[best]
     return "other", ""

@@ -108,7 +108,7 @@ def parse_file(path: Path, repo_root: Path) -> dict | None:
     date = path.parent.name  # YYYY-MM
     year = int(date[:4]) if re.match(r"\d{4}", date) else None
 
-    vuln_slug, vuln_raw = db.classify(header + " " + name)
+    vuln_slug, vuln_raw = db.classify_attack(header, name, code)
     low = code.lower()
     multi = int(any(k in low for k in ("flashloan", "flash loan", "flashswap")) or
                 len(set(txs)) > 1 or "reentran" in low)
