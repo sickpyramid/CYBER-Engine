@@ -67,14 +67,35 @@ python cli.py stats                 # inspect the shipped corpus
 bash scripts/build_corpus.sh
 ```
 
+## Detection tier (runs today, no API key)
+
+```bash
+pip install slither-analyzer solc-select
+# fetch a held-out victim's exact verified source (keyless, Sourcify) and analyze it:
+python cli.py detect polygon 0x3dC7E6FF0fB79770FA6FB05d1ea4deACCe823943   # Market -> reentrancy
+python cli.py scoreboard 25                                               # held-out rediscovery eval
+```
+
+The detector compiles each target's **exact standard-json** (multi-file, OZ imports,
+legacy solc) and runs 102 Slither detectors. Proven: fed the Market victim blind, it
+independently flagged the `redeemFresh`/`borrowFresh` reentrancy that was exploited.
+
 ## Status
 
 - [x] DeFiHackLabs ingester — 920 EVM exploits, 675 with replay fork-blocks
-- [ ] LLM labeling pass (collapse `vuln_class: other`)
+- [x] Keyless held-out source fetch (Sourcify std-json) + Slither detection substrate
+- [x] Held-out scoreboard harness (detection tier) — single-case rediscovery proven (Market)
+- [ ] **LLM labeling pass** — clean ground-truth labels (today the scoreboard scores against the weak keyword classifier)
+- [ ] **Finding ranking + reasoning/retrieval layer** — raw Slither floods reentrancy; pick the true vuln + build the multi-stage path
+- [ ] Harden compilation across all solc versions (some targets still fail to compile)
 - [ ] More sources (reentrancy-list, SlowMist, rekt, Solana incidents)
-- [ ] Train/test split + RAG index
-- [ ] Foundry fork-replay prover + scoreboard
+- [ ] Foundry fork-replay PROVER (exploit tier) — needs an archive RPC key
 - [ ] Qwen LoRA training corpus + script
+
+### Honest read
+The harness is real and runs on real held-out contracts. The current batch numbers are a
+**floor, not a result** — they are capped by noisy labels and naive ranking, both known and
+next on the list. Every fix from here is *measured* against the scoreboard.
 
 ---
 *For authorized security testing and responsible disclosure only.*

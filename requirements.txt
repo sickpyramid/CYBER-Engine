@@ -3,6 +3,10 @@ requests>=2.31
 beautifulsoup4>=4.12
 lxml>=5.0
 
+# Detection tier (static analysis of held-out victims)
+slither-analyzer>=0.11
+solc-select>=1.0
+
 # Retrieval / embeddings for the RAG index (added as the loop lands)
 # sentence-transformers>=3.0
 # faiss-cpu>=1.8
