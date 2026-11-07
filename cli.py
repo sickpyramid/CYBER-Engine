@@ -2,6 +2,7 @@
 """CyberAgent engine CLI.  Usage:
     python cli.py hunt <chain> <address> [block]  # SKILL entrypoint: brief for an agent to write+prove a PoC
     python cli.py prove <workdir|poc.sol>         # run the agent's PoC on a mainnet fork -> proven?
+    python cli.py system <chain> <addr> <addr>... [--check <var>]  # cross-contract value-flow / escalation
     python cli.py detect <chain> <address>        # static (Slither) findings only
     python cli.py scoreboard [N]                  # held-out rediscovery eval over N corpus cases
     python cli.py ingest defihacklabs             # (re)build data/corpus.sqlite from DeFiHackLabs
@@ -112,6 +113,27 @@ def cmd_hunt(chain, address, block=None):
     (work / "brief.json").write_text(json.dumps(brief, indent=1))
     print(json.dumps(brief, indent=1))
 
+def cmd_system(args):
+    """Cross-contract value-flow analysis across a protocol's contracts.
+    Usage: system <chain> <addr1> <addr2> ...  [--check <variable>]
+    Answers: does a finding on a value escalate downstream, or stay low-sev?"""
+    from engine import system
+    chain = args[0]
+    check = None
+    addrs = args[1:]
+    if "--check" in addrs:
+        i = addrs.index("--check"); check = addrs[i + 1]; addrs = addrs[:i]
+    labels = {f"c{i}_{a[:6]}": a for i, a in enumerate(addrs)}
+    res = system.analyze_system(labels, chain)
+    print(res["summary"])
+    print("\nCross-contract VALUE flows (escalation surfaces):")
+    for f in res["value_flows"][:20]:
+        print(f"  {res['contracts'].get(f['producer'],f['producer'])}.{f['getter']}() -> "
+              f"{[res['contracts'].get(c,c) for c in f['consumers']]}")
+    if check:
+        print("\n--- escalation check:", check, "---")
+        print(json.dumps(system.check_variable(res, check), indent=1, default=str))
+
 def cmd_prove(path):
     """Prove the agent-written PoC on a mainnet fork. `path` = the attempt.sol or its workdir."""
     import shutil
@@ -136,4 +158,5 @@ if __name__ == "__main__":
     elif cmd == "scoreboard": cmd_scoreboard(sys.argv[2] if len(sys.argv) > 2 else None)
     elif cmd == "hunt": cmd_hunt(sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else None)
     elif cmd == "prove": cmd_prove(sys.argv[2])
+    elif cmd == "system": cmd_system(sys.argv[2:])
     else: print("unknown:", cmd); print(__doc__)

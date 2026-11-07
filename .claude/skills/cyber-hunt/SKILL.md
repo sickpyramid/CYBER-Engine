@@ -65,6 +65,22 @@ Returns `{"proven": true/false, "profit_logs", "error", "tail"}`.
   fixes: wrong pool/token address, missing `vm.prank`/approval, wrong function signature,
   flashloan callback shape. The example PoCs show the right patterns for this chain.
 
+## Multi-contract / system analysis (don't audit single-layer!)
+A finding on one contract is often low-sev ALONE but high-sev if another contract consumes
+that value for minting/pricing/rewards. Before you rate severity, map the system:
+```bash
+python cli.py system <chain> <addr1> <addr2> ... [--check <variable>]
+```
+It prints the cross-contract VALUE flows (A.getter() consumed by B) and, with `--check`,
+tells you whether a specific variable ESCALATES (consumed downstream for value) or is
+low-sev telemetry (dead-ends). Use it to:
+- turn a low-sev accounting finding into a high-sev cross-contract exploit when the value
+  feeds a mint/price/backing path in another contract, and
+- pick the real attack surface: the getters other contracts read for value (prices,
+  reserve/backing values, rates) are where manipulation (flashloan/donation/oracle) pays off.
+Then build a MULTI-STAGE PoC: manipulate the upstream value → trigger the downstream
+mint/redeem/price → extract. Flashloan to bootstrap capital for the manipulation.
+
 ## Rules
 - Only authorized targets; PoCs run on a fork only; this is for disclosure, not use.
 - A finding is not real until `proven: true`. Never claim an exploit you haven't proven.
