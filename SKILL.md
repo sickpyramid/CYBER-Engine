@@ -81,6 +81,30 @@ low-sev telemetry (dead-ends). Use it to:
 Then build a MULTI-STAGE PoC: manipulate the upstream value → trigger the downstream
 mint/redeem/price → extract. Flashloan to bootstrap capital for the manipulation.
 
+## A/B test the WHOLE hypothesis space (don't test one guess)
+`engine/hypotheses.enumerate_hypotheses(mechanism_result, system_flows)` returns the full
+space: single-contract + mathematical invariant violations (rounding, decimals,
+fee-on-transfer, precision, first-depositor, overflow) + cross-contract (manipulate A →
+trigger B) + flashloan combinations. Write a PoC for EACH, `prove` each, keep what drains.
+Rank by result — that's the A/B matrix.
+
+## Finding NOVEL / hidden bugs (the history makes good contracts immune)
+A contract whose author knew the historical attacks is immune to replaying them. To find
+UNKNOWN bugs you don't match patterns — you break the contract's own assumptions:
+1. Read the target and extract ITS SPECIFIC invariants — properties that must always hold
+   (`engine/invariants.candidate_invariants(archetypes)` gives starting points; add the
+   ones unique to this contract's logic — its reward formula, its accounting identity).
+2. Scaffold a stateful fuzz harness: `engine/invariants.scaffold(addr, alias, block,
+   target_iface, handler_actions, invariant_asserts)` → a Foundry `StdInvariant` test.
+   Fill the interface (functions to fuzz), the handler (bounded fuzz calls), and the
+   `invariant_*` assertions.
+3. Run it: `forge test --match-path <harness> ` — Foundry fuzzes millions of call
+   sequences. **A failing invariant is a candidate NOVEL bug** (a state the author never
+   anticipated). Minimize the failing sequence, confirm it, then weaponize it into a PoC
+   and `prove` it.
+This is how you find what nobody has seen: discover the broken state empirically, not from
+the attack library.
+
 ## Rules
 - Only authorized targets; PoCs run on a fork only; this is for disclosure, not use.
 - A finding is not real until `proven: true`. Never claim an exploit you haven't proven.
