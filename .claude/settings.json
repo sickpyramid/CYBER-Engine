@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(forge:*)",
+      "Bash(anvil:*)",
+      "Bash(cast:*)",
+      "Bash(chisel:*)",
+      "Bash(foundryup:*)"
+    ]
+  }
+}
