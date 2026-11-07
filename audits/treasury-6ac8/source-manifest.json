@@ -1,0 +1,81 @@
+{
+  "target": "0x6Ac8fF96Fb8DCF5d79A8eF1E59D9AC23f2BD27Bc",
+  "chainId": 1,
+  "acquired": "Etherscan exact-match source viewer; compiler input reconstructed from copied files and settings",
+  "compiler": "0.8.26+commit.8a97fa7a",
+  "inputSha256": "6d2ccec11442d0ae896aa55bda2e1fb2022f07357e82a8bde002d835d32b581f",
+  "records": [
+    {
+      "path": "src/Treasury.sol",
+      "characters": 40324,
+      "sha256": "2d5abab5d9d23b0a278e38d85fde05708488c217a07204d91c0185bae3a42f65",
+      "gitBlobLf": "51de5f8514dc1abb4f6899a72f32836b31f80061"
+    },
+    {
+      "path": "lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol",
+      "characters": 2858,
+      "sha256": "cdf6a0bb3f7856dae8d86db8b1c16e27902452527990b5efb1ac5f89459df142",
+      "gitBlobLf": "db01cf4c751ccbeebf0b515c5036b793283bc7a0"
+    },
+    {
+      "path": "lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol",
+      "characters": 709,
+      "sha256": "afa5ee4dd66617a8d61a3172b4dca2376386d9846fb550a1f4e15e819b75806d",
+      "gitBlobLf": "1a38cba3e06a780ecc275aaa53d547cd43aba803"
+    },
+    {
+      "path": "lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol",
+      "characters": 5888,
+      "sha256": "8b407154bd72f635d18ceaab9fa4ee0b484343d47649c980f028ec31ab168c2d",
+      "gitBlobLf": "bb65709b46bdd5f00e253b298f24e49fa6660c07"
+    },
+    {
+      "path": "lib/openzeppelin-contracts/contracts/utils/math/Math.sol",
+      "characters": 15529,
+      "sha256": "b604cdbc4cf26ab017770274674cc5c8722f677bd4ce3db60eb470f30f117c63",
+      "gitBlobLf": "9681524529b34f34033ae97064a2700bfc4eec00"
+    },
+    {
+      "path": "src/interfaces/ISwarmFeed.sol",
+      "characters": 561,
+      "sha256": "4f05616dfe2f3be9e2fe431b695c9a2e300e3e55f9ea1346af02ad38ca73b970",
+      "gitBlobLf": "f35583ba42af459d901df1186e4971b68fdfffbe"
+    },
+    {
+      "path": "src/DeploymentConfig.sol",
+      "characters": 20938,
+      "sha256": "79e04f513f072dfd4b3f1ac36ca84ec48ef46fe70b2f6836ecd0a4587b237aaa",
+      "gitBlobLf": "2a93a833296054950729e2ccbc70fd999df0239b"
+    },
+    {
+      "path": "src/interfaces/IShareVault.sol",
+      "characters": 1242,
+      "sha256": "c98d0c81f85eae698a7076d204d5658041227d43313be0af2a2885b929a3dc78",
+      "gitBlobLf": "e689932c265217326e44465520196657dc5e80a6"
+    },
+    {
+      "path": "src/interfaces/ILaunchFeeShare.sol",
+      "characters": 465,
+      "sha256": "01fa395e2211ffde617818c589a4c1b4e2a01ea5a582f3e8f8deb891886acd77",
+      "gitBlobLf": "5f1ccfde04084447a60f8129f7aa9a91e71b15ce"
+    },
+    {
+      "path": "src/TransientReentrancyGuard.sol",
+      "characters": 1377,
+      "sha256": "c3e450a12efcf3be0311c604e8f68c541c6e4982f9561b4ca9aa1563e2a43638",
+      "gitBlobLf": "aaafb5b6722dec0262772e5301feae2bb8b7367d"
+    },
+    {
+      "path": "lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Permit.sol",
+      "characters": 3832,
+      "sha256": "96dd3ecd4b5e230d0388b4bbc223891e20d148eea226fcdd4e4b486917d4246d",
+      "gitBlobLf": "8d8471dabd07b0a60aca0d9d10744d4962719bb0"
+    },
+    {
+      "path": "lib/openzeppelin-contracts/contracts/utils/Address.sol",
+      "characters": 6418,
+      "sha256": "e53dcc7da8a8142fb1b1fbd9bee7eca13c4f365961fbd487955e3c02f40f73b9",
+      "gitBlobLf": "122872d76ff4c23d0ffadb2017f7c39e8e91b9f0"
+    }
+  ]
+}
