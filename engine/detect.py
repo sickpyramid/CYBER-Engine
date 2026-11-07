@@ -44,7 +44,8 @@ def _ensure_solc(version: str | None):
     os.environ["SOLC_VERSION"] = version
 
 
-def analyze(src_root: str, source_keys: list[str], solc: str | None = None) -> dict:
+def analyze(src_root: str, source_keys: list[str], solc: str | None = None,
+            remappings: list[str] | None = None) -> dict:
     """Compile + detect. Returns ranked, taxonomy-mapped findings."""
     _ensure_solc(solc)
     from crytic_compile import CryticCompile
@@ -57,9 +58,14 @@ def analyze(src_root: str, source_keys: list[str], solc: str | None = None) -> d
     try:
         os.chdir(src_root)
         std = SolcStandardJson()
+        for r in (remappings or []):
+            std.add_remapping(r)
         for k in source_keys:
             if Path(k).exists():
                 std.add_source_file(k)
+        # AST-only: skip bytecode codegen -> avoids 'stack too deep' on viaIR contracts
+        # (Slither analyzes the AST), and it's faster.
+        std._json["settings"]["outputSelection"] = {"*": {"": ["ast"]}}
         sl = Slither(CryticCompile(std, solc="solc"))
         dcls = [getattr(all_detectors, n) for n in dir(all_detectors)
                 if inspect.isclass(getattr(all_detectors, n))
@@ -96,8 +102,10 @@ def analyze(src_root: str, source_keys: list[str], solc: str | None = None) -> d
 
 if __name__ == "__main__":
     src_root, solc, keys_file = sys.argv[1], (sys.argv[2] or None), sys.argv[3]
-    keys = json.load(open(keys_file))
+    data = json.load(open(keys_file))
+    keys = data.get("keys", []) if isinstance(data, dict) else data
+    remaps = data.get("remappings", []) if isinstance(data, dict) else []
     try:
-        print(json.dumps(analyze(src_root, keys, solc)))
+        print(json.dumps(analyze(src_root, keys, solc, remaps)))
     except Exception as e:
         print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}", "findings": [], "predicted_classes": []}))

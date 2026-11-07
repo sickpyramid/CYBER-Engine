@@ -16,13 +16,18 @@ from __future__ import annotations
 import subprocess, json, os, sys, re
 from pathlib import Path
 
-# High-precision price-read signatures scanned directly in source (reliable across
-# Slither API versions, and catches reads via external interfaces).
-PRICE_READ_RE = re.compile(
-    r"\.(getReserves|slot0|getAmountsOut|getAmountOut|latestAnswer|latestRoundData"
-    r"|getUnderlyingPrice|price0CumulativeLast|price1CumulativeLast|consult|get_dy"
-    r"|calc_withdraw_one_coin|getPrice|peek|read)\s*\(", re.I)
-TWAP_RE = re.compile(r"twap|cumulative|observe|timeweighted", re.I)
+# Tier 1 — direct spot-price reads inside the contract (manipulable in one block).
+SPOT_READ_RE = re.compile(
+    r"\.(getReserves|slot0|getAmountsOut|getAmountOut|get_dy|calc_withdraw_one_coin)\s*\(", re.I)
+# Tier 2 — the victim DELEGATES pricing to an external feed it trusts. The manipulable
+# read lives in that feed (cross-contract), so trusting it unvalidated is the oracle set-up.
+EXTERNAL_PRICE_RE = re.compile(
+    r"\.(latestAnswer|latestRoundData|getUnderlyingPrice|getPrice|getAssetPrice|assetPrice"
+    r"|getRate|exchangeRate|getExchangeRate|consult|peek|getValue|getConversionRate"
+    r"|price0CumulativeLast|price1CumulativeLast|quote|getQuote)\s*\(", re.I)
+# Tier 3 — value derived from a raw pool balance / supply ratio (donation & flashloan skew).
+BALANCE_RATIO_RE = re.compile(r"\.balanceOf\s*\([^)]*\)\s*[*/]", re.I)
+TWAP_RE = re.compile(r"\b(twap|timeweighted|time-weighted|observe\s*\()", re.I)
 
 # ---- attacker heuristics: signatures that betray a manipulable price source ----
 SPOT_PRICE_SIGS = ("getreserves", "slot0", "getamountsout", "getamountout",
@@ -46,7 +51,7 @@ AUTH_MODIFIERS = ("onlyowner", "onlyadmin", "onlygovernance", "onlyrole", "auth"
                   "restricted", "onlyoperator", "owneronly", "onlyguardian")
 
 
-def _slither(src_root, solc, keys):
+def _slither(src_root, solc, keys, remappings=None):
     artifacts = Path.home() / ".solc-select" / "artifacts" / f"solc-{solc}" if solc else None
     env = dict(os.environ, PATH=f"{Path.home()/'.local/bin'}:{os.environ.get('PATH','')}")
     if solc and artifacts and not artifacts.exists():
@@ -60,9 +65,13 @@ def _slither(src_root, solc, keys):
     os.chdir(src_root)
     try:
         std = SolcStandardJson()
+        for r in (remappings or []):
+            std.add_remapping(r)
         for k in keys:
             if Path(k).exists():
                 std.add_source_file(k)
+        # AST-only: skip bytecode codegen -> avoids 'stack too deep' (viaIR) contracts.
+        std._json["settings"]["outputSelection"] = {"*": {"": ["ast"]}}
         return Slither(CryticCompile(std, solc="solc")), cwd
     except Exception:
         os.chdir(cwd)
@@ -132,30 +141,40 @@ def hypotheses(model: dict) -> list[dict]:
     """Adversarial reasoning: turn the model into ranked attack hypotheses."""
     H = []
     arche = set(model["archetypes"])
-    # A spot read (getReserves/slot0/...) is manipulable even if the pair interface also
-    # declares cumulative accumulators. Only down-weight if the read itself is time-weighted.
-    spot = [s for s in model["price_sources"]
-            if s in ("getreserves", "slot0", "getamountsout", "getamountout",
-                     "latestanswer", "getunderlyingprice", "get_dy", "getprice", "peek")]
+    spot = model.get("spot_reads", [])
+    deps = model.get("price_deps", [])
+    bal_ratio = model.get("balance_ratio", False)
+    twap = model.get("_has_twap", False)
 
-    # 1) Spot-price oracle -> flashloan oracle manipulation (the #1 blind spot)
-    if spot:
-        pricing_fns = [e["fn"] for e in model["entry_points"] if e["reads_price"]]
-        H.append({
-            "vuln_class": "price_oracle_manip", "confidence": 0.8,
-            "evidence": f"spot price read from {model['price_sources']} in {pricing_fns[:3]}",
-            "attack_path": [
-                "flashloan a large amount of one asset",
-                f"skew the pool/reserve the price is read from ({model['price_sources'][:2]})",
-                f"invoke {pricing_fns[:1]} while price is distorted to mint/borrow/withdraw excess value",
-                "unwind the skew and repay the flashloan, keeping the difference",
-            ],
-            "multi_stage": True,
-        })
-        # flashloan is the funding vector for the same bug
-        H.append({"vuln_class": "flashloan_assisted", "confidence": 0.55,
-                  "evidence": "manipulable single-block price in an accounting path",
-                  "attack_path": ["flashloan bootstrap capital", "distort price", "extract", "repay"],
+    # 1) Oracle / price manipulation — tiered by how directly the price is manipulable.
+    oracle_conf, evidence, stages = 0.0, "", []
+    if spot:                                   # Tier 1: reads the spot price itself
+        oracle_conf = 0.82
+        evidence = f"in-contract spot price read ({spot}) with no TWAP guard"
+        stages = ["flashloan a large amount of one asset",
+                  f"skew the pool the price is read from ({spot})",
+                  "invoke the pricing/accounting fn while the price is distorted",
+                  "unwind and repay the flashloan, keeping the difference"]
+    elif bal_ratio and not twap:               # Tier 3: value from a raw balance ratio
+        oracle_conf = 0.6
+        evidence = "value derived from a raw token balance/supply ratio (donation-skewable)"
+        stages = ["flashloan or donate tokens into the pool/vault",
+                  "inflate the balance the valuation divides by",
+                  "mint/redeem against the skewed valuation", "withdraw and repay"]
+    elif deps and not twap:                     # Tier 2: trusts an EXTERNAL price feed (cross-contract)
+        oracle_conf = 0.6
+        evidence = (f"delegates pricing to an external feed ({deps}) with no cross-check/TWAP — "
+                    "the manipulable read lives in that feed (cross-contract)")
+        stages = ["identify the external feed this contract trusts",
+                  "if that feed is AMM/balance-based, flashloan-skew its underlying pool",
+                  "call this contract's priced fn while the trusted feed is distorted",
+                  "extract value, unwind, repay"]
+    if oracle_conf:
+        H.append({"vuln_class": "price_oracle_manip", "confidence": oracle_conf,
+                  "evidence": evidence, "attack_path": stages, "multi_stage": True})
+        H.append({"vuln_class": "flashloan_assisted", "confidence": oracle_conf - 0.05,
+                  "evidence": "manipulable price in an accounting path, bootstrapped with borrowed capital",
+                  "attack_path": ["flashloan capital", "distort the trusted price", "extract", "repay"],
                   "multi_stage": True})
 
     # 2) Vault / lending share accounting -> first-depositor / inflation
@@ -207,8 +226,8 @@ def hypotheses(model: dict) -> list[dict]:
     return H
 
 
-def analyze(src_root, source_keys, solc=None) -> dict:
-    sl, cwd = _slither(src_root, solc, source_keys)
+def analyze(src_root, source_keys, solc=None, remappings=None) -> dict:
+    sl, cwd = _slither(src_root, solc, source_keys, remappings)
     try:
         model = build_model(sl)
     finally:
@@ -220,8 +239,10 @@ def analyze(src_root, source_keys, solc=None) -> dict:
         p = Path(src_root) / k
         if p.exists():
             src_text += p.read_text(errors="replace") + "\n"
-    scanned = sorted({m.group(1).lower() for m in PRICE_READ_RE.finditer(src_text)})
-    model["price_sources"] = sorted(set(model["price_sources"]) | set(scanned))
+    model["spot_reads"] = sorted({m.group(1).lower() for m in SPOT_READ_RE.finditer(src_text)})
+    model["price_deps"] = sorted({m.group(1).lower() for m in EXTERNAL_PRICE_RE.finditer(src_text)})
+    model["balance_ratio"] = bool(BALANCE_RATIO_RE.search(src_text))
+    model["price_sources"] = sorted(set(model["price_sources"]) | set(model["spot_reads"]))
     model["_has_twap"] = bool(TWAP_RE.search(src_text))
     H = hypotheses(model)
     return {"ok": True, "archetypes": model["archetypes"],
@@ -236,9 +257,11 @@ def analyze(src_root, source_keys, solc=None) -> dict:
 
 if __name__ == "__main__":
     src_root, solc, keys_file = sys.argv[1], (sys.argv[2] or None), sys.argv[3]
-    keys = json.load(open(keys_file))
+    data = json.load(open(keys_file))
+    keys = data.get("keys", []) if isinstance(data, dict) else data
+    remaps = data.get("remappings", []) if isinstance(data, dict) else []
     try:
-        print(json.dumps(analyze(src_root, keys, solc)))
+        print(json.dumps(analyze(src_root, keys, solc, remaps)))
     except Exception as e:
         print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}",
                           "predicted_classes": [], "hypotheses": []}))

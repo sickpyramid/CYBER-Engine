@@ -45,11 +45,12 @@ def fetch(chain: str, address: str, out_dir: str | Path) -> dict | None:
 
     comp = d.get("compilation", {})
     solc = (comp.get("compilerVersion") or "").split("+")[0] or None
+    remappings = (sj.get("settings", {}) or {}).get("remappings", []) or []
     md = d.get("metadata", {}) or {}
     target = None
     ct = (md.get("settings", {}) or {}).get("compilationTarget", {})
     if ct:
         target = list(ct.keys())[0]
     return {"src_root": str(src_root), "source_keys": keys, "solc": solc,
-            "contract": comp.get("name"), "target": target,
+            "remappings": remappings, "contract": comp.get("name"), "target": target,
             "n_files": len(keys), "chain": chain, "address": address}
