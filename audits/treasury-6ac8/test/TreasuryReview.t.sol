@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-// UNIT TESTS ONLY. Not executed in this environment.
+// UNIT TESTS ONLY. Run with Foundry CI against the copied verified source.
 // These deploy the exact copied Treasury source with local mock dependencies.
 // This suite does not claim a mainnet exploit, a live affected token, or profit.
 import {Treasury} from "../verified/src/Treasury.sol";
@@ -11,6 +11,7 @@ import {ISwarmFeed} from "../verified/src/interfaces/ISwarmFeed.sol";
 interface Vm {
     function prank(address) external;
     function expectRevert(bytes4) external;
+    function expectRevert(bytes calldata) external;
     function warp(uint256) external;
     function etch(address, bytes calldata) external;
 }
@@ -20,15 +21,18 @@ contract MockToken {
     Treasury public target;
     bool public callbackBeforeDebit;
     bool public callbackAfterDebit;
+    bool public revertAfterCallback;
     function mint(address to, uint256 amount) external { balanceOf[to] += amount; }
     function configure(Treasury t, bool before_, bool after_) external {
         target = t; callbackBeforeDebit = before_; callbackAfterDebit = after_;
     }
+    function setRevertAfterCallback(bool shouldRevert) external { revertAfterCallback = shouldRevert; }
     function transfer(address to, uint256 amount) external returns (bool) {
         if (callbackBeforeDebit) target.sync(IERC20(address(this)));
         balanceOf[msg.sender] -= amount;
         balanceOf[to] += amount;
         if (callbackAfterDebit) target.sync(IERC20(address(this)));
+        if (revertAfterCallback) revert("MOCK_ROLLBACK");
         return true;
     }
     function decimals() external pure returns (uint8) { return 18; }
@@ -86,6 +90,30 @@ contract TreasuryReviewTest {
         t.withdraw(IERC20(address(spare)),RECIPIENT,10 ether);
         require(t.totalReceived(IERC20(address(spare)))==100 ether,"unexpected revenue");
     }
+    function test_repeatedPreDebitCallbacksInflateOnlyBookReceipts() public {
+        spare.mint(address(t),100 ether);
+        t.sync(IERC20(address(spare)));
+        spare.configure(t,true,false);
+        vm.prank(OPERATOR);
+        t.withdraw(IERC20(address(spare)),RECIPIENT,10 ether);
+        vm.prank(OPERATOR);
+        t.withdraw(IERC20(address(spare)),RECIPIENT,10 ether);
+        require(t.totalReceived(IERC20(address(spare)))==120 ether,"two phantom receipts");
+        require(spare.balanceOf(address(t))==80 ether,"real balance after two withdrawals");
+        require(spare.balanceOf(RECIPIENT)==20 ether,"only authorized amounts transferred");
+    }
+    function test_revertingCallbackRollsBackAccounting() public {
+        spare.mint(address(t),100 ether);
+        t.sync(IERC20(address(spare)));
+        spare.configure(t,true,false);
+        spare.setRevertAfterCallback(true);
+        vm.prank(OPERATOR);
+        (bool ok,) = address(t).call(abi.encodeCall(Treasury.withdraw,(IERC20(address(spare)),RECIPIENT,10 ether)));
+        require(!ok,"expected revert");
+        require(t.totalReceived(IERC20(address(spare)))==100 ether,"receipt must roll back");
+        require(spare.balanceOf(address(t))==100 ether,"token balance must roll back");
+        require(spare.balanceOf(RECIPIENT)==0,"recipient must remain empty");
+    }
     function test_ordinaryWithdrawalCreditsUnsyncedRevenueOnce() public {
         spare.mint(address(t),100 ether);
         t.sync(IERC20(address(spare)));
@@ -111,7 +139,7 @@ contract TreasuryReviewTest {
     function test_operatorCannotTakeCollateral() public {
         collateral.mint(address(t),100 ether);
         vm.prank(OPERATOR);
-        vm.expectRevert(Treasury.ReserveProtected.selector);
+        vm.expectRevert(abi.encodeWithSelector(Treasury.ReserveProtected.selector,IERC20(address(collateral))));
         t.withdraw(IERC20(address(collateral)),RECIPIENT,1 ether);
     }
     function test_listedReserveCannotBeWithdrawnByOperator() public {
@@ -119,14 +147,14 @@ contract TreasuryReviewTest {
         t.setReserveAsset(IERC20(address(spare)),ISwarmFeed(address(f)),10000);
         spare.mint(address(t),100 ether);
         vm.prank(OPERATOR);
-        vm.expectRevert(Treasury.ReserveProtected.selector);
+        vm.expectRevert(abi.encodeWithSelector(Treasury.ReserveProtected.selector,IERC20(address(spare))));
         t.withdraw(IERC20(address(spare)),RECIPIENT,1 ether);
     }
     function test_badDebtFloorRestrictsStablecoinWithdrawal() public {
         stable.mint(address(t),100 ether);
         v.setBadDebt(80 ether);
         vm.prank(OPERATOR);
-        vm.expectRevert(Treasury.BadDebtFirst.selector);
+        vm.expectRevert(abi.encodeWithSelector(Treasury.BadDebtFirst.selector,80 ether));
         t.withdraw(IERC20(address(stable)),RECIPIENT,21 ether);
         vm.prank(OPERATOR);
         t.withdraw(IERC20(address(stable)),RECIPIENT,20 ether);
