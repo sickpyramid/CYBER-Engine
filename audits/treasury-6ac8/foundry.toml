@@ -1,0 +1,9 @@
+[profile.default]
+src = "verified/src"
+test = "test"
+libs = ["verified/lib"]
+solc_version = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+remappings = ["@openzeppelin/contracts/=verified/lib/openzeppelin-contracts/contracts/"]
