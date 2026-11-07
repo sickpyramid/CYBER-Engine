@@ -1,0 +1,17 @@
+# Core ingestion/analysis (CPU, runs anywhere)
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+
+# Retrieval / embeddings for the RAG index (added as the loop lands)
+# sentence-transformers>=3.0
+# faiss-cpu>=1.8
+
+# Training (GPU box only — kept optional so the engine installs on CPU)
+# torch>=2.3
+# transformers>=4.51
+# peft>=0.11
+# trl>=0.9
+# datasets>=2.19
+# bitsandbytes>=0.43
+# accelerate>=0.30

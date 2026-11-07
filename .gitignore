@@ -1,0 +1,17 @@
+# vendored source corpora (cloned on build, not committed)
+vendor/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# build / scratch artifacts
+*.log
+data/*.tmp
+data/rag_index/
+training/out/
+models/
+
+# keep the shipped corpus db tracked (do NOT ignore data/corpus.sqlite)
