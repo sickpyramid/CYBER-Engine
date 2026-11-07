@@ -18,3 +18,16 @@ jobs:
         run: |
           forge --version
           forge test --match-contract TreasuryReviewTest -vvv
+      - name: Install engine analysis dependencies
+        run: |
+          python -m pip install -r ../../requirements.txt
+          solc-select install 0.8.26
+          solc-select use 0.8.26
+      - name: Run original engine on complete corpus
+        run: python engine_full_review.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: treasury-engine-analysis
+          path: audits/treasury-6ac8/engine-full-results.json
+          if-no-files-found: ignore
