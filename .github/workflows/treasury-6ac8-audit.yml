@@ -1,0 +1,20 @@
+name: Treasury 0.8.26 audit proof
+on:
+  push:
+    branches: [audit/treasury-6ac8-compiler-proof]
+  workflow_dispatch:
+jobs:
+  foundry:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: audits/treasury-6ac8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Compiler and test execution
+        run: |
+          forge --version
+          forge test --match-contract TreasuryReviewTest -vvv
