@@ -110,16 +110,35 @@ def _codesize(rpc: str, addr: str) -> int:
     return (len(h) - 2) // 2 if h.startswith("0x") else -1
 
 
+HOT_NONCE = 500  # an EOA past this many txs is an automated/server key, not a cold wallet
+
+
+def _nonce(rpc: str, addr: str) -> int:
+    env = dict(os.environ, PATH=f"{FOUNDRY_BIN}:{os.environ.get('PATH','')}")
+    try:
+        r = subprocess.run(["cast", "nonce", addr, "--rpc-url", rpc],
+                           capture_output=True, text=True, timeout=25, env=env)
+        return int((r.stdout or "0").strip())
+    except Exception:
+        return -1
+
+
 def classify_address(rpc: str, addr: str) -> dict:
     """What is this terminal? EOA / Gnosis Safe / Timelock / unknown contract — the
-    single most important question in the whole graph, answered from chain state."""
+    single most important question in the whole graph, answered from chain state.
+    For an EOA we also read the nonce: a high nonce = a HOT automated/server key (the
+    kind that lives in an env var and dies with the server), a low nonce = a cold wallet."""
     addr = addr.strip().lower()
     out = {"address": addr, "kind": "eoa", "detail": {}}
     sz = _codesize(rpc, addr)
     out["code_bytes"] = sz
     if sz <= 0:
         out["kind"] = "eoa"
-        out["risk"] = "SINGLE KEY — one private key compromise is total control"
+        n = _nonce(rpc, addr)
+        out["nonce"] = n
+        out["hot"] = n >= HOT_NONCE
+        heat = f"HOT automated/server key (nonce {n})" if out["hot"] else f"cold wallet (nonce {n})"
+        out["risk"] = f"SINGLE KEY, {heat} — one key compromise is total control of this role"
         return out
     # it's a contract. multisig?
     thr = _cast(rpc, addr, "getThreshold()(uint256)")
@@ -282,6 +301,44 @@ def analyze_composition(target: str, src_root: str, source_keys: list[str],
                       "spot/AMM reserve, flash-loan-move it within one tx",
         })
 
+    # 4e. INFRA EXPOSURE — "if their ops server is popped, what happens?"
+    # Map each privileged power to the role that gates it, then ask: does a HOT (automated/
+    # server) key gate a FUND-CRITICAL power? That is the drain-on-breach test.
+    GATE_TO_ROLE = {
+        "_requireadmin": "admin", "canupgrade": "admin", "_authorizeupgrade": "admin",
+        "_requireguardoradmin": "guard", "_requirewhitelistmanager": "whitelistManager",
+        "_requirerelayer": "relayer", "onlyowner": "owner", "_checkowner": "owner",
+    }
+    def _role_terminal(role):
+        # direct, or the admin funnel (upgradeController/admin/owner all resolve to the admin terminal)
+        if role in terminals: return terminals[role]
+        if role == "admin":
+            for r in ("upgradeController", "admin", "owner", "governance"):
+                if r in terminals: return terminals[r]
+        return None
+    infra = {"hot_fund_powers": [], "hot_ops_powers": [], "cold_fund_powers": []}
+    for p in powers:
+        role = GATE_TO_ROLE.get(p["gate"].lower())
+        t = _role_terminal(role) if role else None
+        if not t:
+            continue
+        entry = {"fn": p["fn"], "role": role, "terminal": t["address"], "kind": t["kind"]}
+        if p["fund_critical"] and t.get("hot"):
+            infra["hot_fund_powers"].append(entry)
+        elif t.get("hot"):
+            infra["hot_ops_powers"].append(entry)
+        elif p["fund_critical"]:
+            infra["cold_fund_powers"].append(entry)
+    if infra["hot_fund_powers"]:
+        weaknesses.append({"class": "server_compromise_drains", "severity": "critical",
+            "detail": f"a HOT key gates fund-critical powers {[e['fn'] for e in infra['hot_fund_powers']]}"
+                      f" -> popping that server drains funds"})
+    elif infra["hot_ops_powers"] and infra["cold_fund_powers"]:
+        weaknesses.append({"class": "hot_keys_firewalled", "severity": "info",
+            "detail": f"hot keys gate only ops powers {[e['fn'] for e in infra['hot_ops_powers']][:6]}; "
+                      f"fund-critical powers sit behind COLD terminals -> a server breach griefs "
+                      f"(pause/censor/deanonymize/sandwich) but does NOT drain"})
+
     # 5. trust-delegation seams (where value conservation leaves the Solidity)
     seams = trust_delegation(src)
 
@@ -291,8 +348,9 @@ def analyze_composition(target: str, src_root: str, source_keys: list[str],
     return {
         "target": target, "chain": chain, "rpc_available": bool(rpc),
         "powers": powers, "roles": resolved, "surfaces": surfaces,
-        "weaknesses": weaknesses, "trust_delegation": seams, "attack_chains": chains,
-        "summary": _summary(target, terminals, has_timelock, weaknesses, chains, seams),
+        "weaknesses": weaknesses, "trust_delegation": seams, "infra_exposure": infra,
+        "attack_chains": chains,
+        "summary": _summary(target, terminals, has_timelock, weaknesses, chains, seams, infra),
     }
 
 
@@ -380,12 +438,20 @@ def _build_chains(target, powers, terminals, surfaces, has_timelock) -> list[dic
     return chains
 
 
-def _summary(target, terminals, has_timelock, weaknesses, chains, seams=None) -> str:
+def _summary(target, terminals, has_timelock, weaknesses, chains, seams=None, infra=None) -> str:
     lines = [f"COMPOSITION / ATTACK-GRAPH — {target}"]
     if terminals:
         lines.append("Trust terminals (who really holds each power):")
         for role, t in terminals.items():
-            lines.append(f"  {role:18s} -> {t['address']}  [{t['kind']}] {t.get('risk','')}")
+            heat = "" if t["kind"] != "eoa" else (" HOT" if t.get("hot") else " cold")
+            lines.append(f"  {role:18s} -> {t['address']}  [{t['kind']}{heat}] {t.get('risk','')}")
+    if infra:
+        lines.append("Infra exposure (if the ops server is popped):")
+        if infra["hot_fund_powers"]:
+            lines.append(f"  !! HOT key gates FUND-CRITICAL: {[e['fn'] for e in infra['hot_fund_powers']]} -> BREACH DRAINS")
+        else:
+            lines.append(f"  hot keys gate ops only {[e['fn'] for e in infra['hot_ops_powers']][:6]}; "
+                         f"fund powers behind cold keys -> breach griefs/deanonymizes, does NOT drain")
     lines.append(f"Timelock on fund-critical powers: {'YES' if has_timelock else 'NO'}")
     if weaknesses:
         lines.append("Composition weaknesses:")
