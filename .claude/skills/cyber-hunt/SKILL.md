@@ -65,6 +65,29 @@ Returns `{"proven": true/false, "profit_logs", "error", "tail"}`.
   fixes: wrong pool/token address, missing `vm.prank`/approval, wrong function signature,
   flashloan callback shape. The example PoCs show the right patterns for this chain.
 
+## Composition / attack-graph — ALWAYS run this FIRST (think attacker, not auditor)
+Before asking "is this contract sound?", ask the attacker's question: "what does it TRUST
+and CALL that I can bend?" Most drains are composition, not a single-contract bug.
+```bash
+python cli.py compose <chain> <target_address>
+```
+It resolves the proxy to its EIP-1967 implementation, walks every privileged setter's
+access gate to the on-chain address that really satisfies it (hop by hop), and classifies
+each terminal — **EOA / Gnosis Safe (threshold+owners) / Timelock (delay) / custom
+controller**. It flags what a single-contract audit cannot see: fund-critical power with
+**no timelock** (instant, silent), **bare-EOA** terminals, **one key reused across two
+tiers** (e.g. a hot role key that is also a multisig signer), and **external value routes**
+(swap router / oracle) a flash loan can move. It emits staged multi-contract chains.
+Use it to decide the shape of the attack:
+- if a fund-critical gate (setVerifiers / upgrade / setOracle / sweep) has no timelock and
+  resolves to an EOA or low-threshold multisig → the drain is a trust/governance vector
+  (usually NOT a payable bounty bug, but say so plainly and name the one fix: a timelock).
+- if value is routed through an external router/oracle with caller params → that is the
+  KEYLESS composition surface: flash-loan-move the external pool, let the target execute
+  against it. Build the multi-stage PoC from there.
+Be honest: a 2-of-3 Safe admin is a real mitigation; "admin can rug" on a multisig is
+usually informational. The prize is the keyless cross-contract path, not the key risk.
+
 ## Multi-contract / system analysis (don't audit single-layer!)
 A finding on one contract is often low-sev ALONE but high-sev if another contract consumes
 that value for minting/pricing/rewards. Before you rate severity, map the system:
