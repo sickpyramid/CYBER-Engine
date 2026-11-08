@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CYBER SWARM — live exploit team</title>
+<style>
+  :root{
+    --bg:#070a0f; --panel:#0d131c; --panel2:#111a26; --line:#1c2a3a;
+    --txt:#c9d6e5; --dim:#6b7d93; --accent:#2de2a6;
+    --recon:#35c3ff; --attacker:#ff4d5e; --skeptic:#ffb02e; --dev:#b57bff;
+    --referee:#2de2a6; --engine:#5a6b80; --system:#47566b; --lead:#ffffff; --find:#2de2a6;
+    --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--txt);font-family:var(--mono);font-size:13px;
+       display:flex;flex-direction:column;overflow:hidden}
+  .top{display:flex;align-items:center;gap:16px;padding:10px 16px;background:linear-gradient(180deg,#0b1119,#070a0f);
+       border-bottom:1px solid var(--line);flex-wrap:wrap}
+  .brand{font-weight:700;letter-spacing:2px;color:var(--accent);font-size:15px}
+  .brand b{color:#fff}
+  .dot{width:8px;height:8px;border-radius:50%;background:#444;display:inline-block;margin-right:6px}
+  .dot.on{background:var(--accent);box-shadow:0 0 10px var(--accent);animation:pulse 1.4s infinite}
+  @keyframes pulse{50%{opacity:.4}}
+  .stat{color:var(--dim)} .stat b{color:var(--txt)}
+  .target{color:var(--skeptic);max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .spacer{flex:1}
+  button{background:var(--panel2);color:var(--txt);border:1px solid var(--line);padding:6px 12px;
+         border-radius:6px;cursor:pointer;font-family:var(--mono);font-size:12px}
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  button.go{background:var(--accent);color:#04120d;border:none;font-weight:700}
+  button.stop{border-color:var(--attacker);color:var(--attacker)}
+  .main{flex:1;display:flex;min-height:0}
+  .agents{width:200px;border-right:1px solid var(--line);padding:10px;display:flex;flex-direction:column;gap:8px;background:var(--panel)}
+  .agent{padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel2);opacity:.55;transition:.2s}
+  .agent.active{opacity:1;box-shadow:0 0 0 1px currentColor inset}
+  .agent .nm{font-weight:700;letter-spacing:1px} .agent .ro{color:var(--dim);font-size:11px;margin-top:2px}
+  .agent.RECON{color:var(--recon)} .agent.ATTACKER{color:var(--attacker)} .agent.SKEPTIC{color:var(--skeptic)}
+  .agent.EXPLOIT_DEV{color:var(--dev)} .agent.REFEREE{color:var(--referee)}
+  .feedwrap{flex:1;display:flex;flex-direction:column;min-width:0}
+  #feed{flex:1;overflow-y:auto;padding:14px 18px;scroll-behavior:smooth}
+  .msg{margin-bottom:12px;animation:fade .25s ease}
+  @keyframes fade{from{opacity:0;transform:translateY(4px)}}
+  .msg .hd{font-weight:700;letter-spacing:1px;font-size:11px;margin-bottom:3px;display:flex;gap:8px;align-items:center}
+  .msg .hd .t{color:var(--dim);font-weight:400}
+  .msg .bd{white-space:pre-wrap;line-height:1.5;color:var(--txt);border-left:2px solid var(--line);padding-left:10px}
+  .RECON .hd{color:var(--recon)} .RECON .bd{border-color:var(--recon)}
+  .ATTACKER .hd{color:var(--attacker)} .ATTACKER .bd{border-color:var(--attacker)}
+  .SKEPTIC .hd{color:var(--skeptic)} .SKEPTIC .bd{border-color:var(--skeptic)}
+  .EXPLOIT_DEV .hd{color:var(--dev)} .EXPLOIT_DEV .bd{border-color:var(--dev)}
+  .REFEREE .hd{color:var(--referee)} .REFEREE .bd{border-color:var(--referee)}
+  .ENGINE .hd{color:var(--engine)} .ENGINE .bd{border-color:var(--engine);color:var(--dim);font-size:12px}
+  .SYSTEM .bd,.SYSTEM .hd{color:var(--system)} .SYSTEM .bd{border-color:var(--system)}
+  .TEAM_LEAD .hd{color:var(--lead)} .TEAM_LEAD .bd{border-color:var(--lead);color:#fff}
+  .ev{color:var(--dim);font-size:11px;margin:6px 0;font-style:italic}
+  .ev.poc{color:var(--dev)} .ev.round{color:var(--accent)}
+  .finding{background:linear-gradient(90deg,rgba(45,226,166,.14),transparent);border:1px solid var(--find);
+           border-radius:8px;padding:10px 12px;margin:12px 0;color:var(--find)}
+  .finding b{color:#fff}
+  .right{width:300px;border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column}
+  .right h3{margin:0;padding:10px 14px;font-size:11px;letter-spacing:2px;color:var(--dim);border-bottom:1px solid var(--line)}
+  #findings{flex:1;overflow-y:auto;padding:10px 14px}
+  .fcard{border:1px solid var(--find);border-radius:8px;padding:8px;margin-bottom:8px;font-size:12px;color:var(--find)}
+  .fcard .ft{color:#fff;font-weight:700}
+  .addbox{padding:10px 14px;border-top:1px solid var(--line);display:flex;gap:6px;flex-wrap:wrap}
+  .addbox select,.addbox input{background:var(--panel2);border:1px solid var(--line);color:var(--txt);
+       border-radius:6px;padding:6px;font-family:var(--mono);font-size:12px}
+  .addbox input{flex:1;min-width:120px}
+  .chat{display:flex;gap:8px;padding:10px 16px;border-top:1px solid var(--line);background:var(--panel)}
+  .chat input{flex:1;background:var(--panel2);border:1px solid var(--line);color:#fff;border-radius:8px;
+       padding:10px;font-family:var(--mono);font-size:13px}
+  .chat input:focus{outline:none;border-color:var(--accent)}
+  .warn{color:var(--skeptic);font-size:11px;padding:4px 16px;background:rgba(255,176,46,.08)}
+  @media(max-width:900px){.agents{display:none}.right{display:none}}
+</style>
+</head>
+<body>
+  <div class="top">
+    <span class="brand">CYBER<b>SWARM</b></span>
+    <span><span id="live" class="dot"></span><span id="state" class="stat">idle</span></span>
+    <span class="stat">targets <b id="s_t">0</b></span>
+    <span class="stat">calls <b id="s_c">0</b></span>
+    <span class="stat">findings <b id="s_f" style="color:var(--find)">0</b></span>
+    <span class="target" id="curtarget">—</span>
+    <span class="spacer"></span>
+    <button class="go" id="btnStart">▶ START HUNT</button>
+    <button id="btnPause">⏸ pause</button>
+    <button class="stop" id="btnStop">■ stop</button>
+  </div>
+  <div id="warn" class="warn" style="display:none"></div>
+  <div class="main">
+    <div class="agents" id="agents"></div>
+    <div class="feedwrap">
+      <div id="feed"></div>
+      <div class="chat">
+        <input id="chatin" placeholder="talk to the team (steer them, ask, point them at a function)…" autocomplete="off">
+        <button id="send">send</button>
+      </div>
+    </div>
+    <div class="right">
+      <h3>CONFIRMED FINDINGS</h3>
+      <div id="findings"><div class="stat" style="padding:10px;color:var(--dim)">none yet — only fork-proven drains appear here.</div></div>
+      <h3>QUEUE A TARGET</h3>
+      <div class="addbox">
+        <select id="chain"><option value="ethereum">ETH</option><option value="bsc">BSC</option></select>
+        <input id="addr" placeholder="0x contract address">
+        <button id="addbtn">+ hunt</button>
+      </div>
+    </div>
+  </div>
+<script>
+const AGENTS=[["RECON","maps mechanism + trust graph"],["ATTACKER","finds the drain"],
+  ["SKEPTIC","kills fake findings"],["EXPLOIT_DEV","writes the PoC"],["REFEREE","proves it on a fork"]];
+const agentsEl=document.getElementById('agents');
+AGENTS.forEach(([n,r])=>{const d=document.createElement('div');d.className='agent '+n;d.id='ag_'+n;
+  d.innerHTML=`<div class="nm">${n.replace('_',' ')}</div><div class="ro">${r}</div>`;agentsEl.appendChild(d);});
+const feed=document.getElementById('feed');
+function atBottom(){return feed.scrollHeight-feed.scrollTop-feed.clientHeight<120;}
+function add(html){const stick=atBottom();feed.insertAdjacentHTML('beforeend',html);if(stick)feed.scrollTop=feed.scrollHeight;}
+function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function tstr(ts){return new Date((ts||Date.now()/1000)*1000).toLocaleTimeString();}
+function active(role){document.querySelectorAll('.agent').forEach(a=>a.classList.remove('active'));
+  const el=document.getElementById('ag_'+role);if(el)el.classList.add('active');}
+
+let ws, reconnectT;
+function connect(){
+  ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
+  ws.onopen=()=>{document.getElementById('state').textContent='connected';};
+  ws.onclose=()=>{document.getElementById('live').classList.remove('on');
+    document.getElementById('state').textContent='reconnecting…';clearTimeout(reconnectT);reconnectT=setTimeout(connect,2000);};
+  ws.onmessage=e=>handle(JSON.parse(e.data));
+}
+function stats(s){if(!s)return;document.getElementById('s_t').textContent=s.targets??0;
+  document.getElementById('s_c').textContent=s.calls??0;document.getElementById('s_f').textContent=s.findings??0;}
+function handle(ev){
+  if(ev.stats)stats(ev.stats);
+  if(ev.target&&ev.target.address)document.getElementById('curtarget').textContent=
+    (ev.target.name||'')+'  '+ev.target.chain+':'+ev.target.address.slice(0,10)+'…';
+  switch(ev.type){
+    case 'message':{const r=ev.role||'SYSTEM';active(r);
+      add(`<div class="msg ${r}"><div class="hd">${r.replace('_',' ')}<span class="t">${tstr(ev.ts)}</span></div><div class="bd">${esc(ev.content)}</div></div>`);break;}
+    case 'thinking':active(ev.role);break;
+    case 'tool':add(`<div class="ev">⚙ ${ev.role} runs <b>${ev.tool}</b> ${esc(ev.args||'')}</div>`);break;
+    case 'round':add(`<div class="ev round">— round ${ev.n} —</div>`);break;
+    case 'poc':add(`<div class="ev poc">🧪 Exploit Dev shipped a PoC (${ev.size} bytes) → proving on fork…</div>`);break;
+    case 'target_start':add(`<div class="ev">🎯 new target: ${esc(ev.target.name||'')} ${ev.target.chain}:${ev.target.address}</div>`);break;
+    case 'target_done':add(`<div class="ev">${ev.found?'✅':'▫'} target done (${ev.found?'FINDING':'no proven bug'})</div>`);break;
+    case 'finding':addFinding(ev.finding);break;
+    case 'swarm_start':document.getElementById('live').classList.add('on');document.getElementById('state').textContent='HUNTING';break;
+    case 'swarm_stop':document.getElementById('live').classList.remove('on');document.getElementById('state').textContent='stopped';break;
+    case 'system':add(`<div class="ev">${esc(ev.content)}</div>`);break;
+    case 'targets_fetched':add(`<div class="ev">📡 fetched ${ev.count} new targets</div>`);break;
+  }
+}
+function addFinding(f){
+  if(!f)return;
+  add(`<div class="finding">✅ <b>CONFIRMED FINDING</b> on ${esc(f.target.name||f.target.address)} — proven on fork.</div>`);
+  const fd=document.getElementById('findings');
+  if(fd.querySelector('.stat'))fd.innerHTML='';
+  const d=document.createElement('div');d.className='fcard';
+  d.innerHTML=`<div class="ft">${esc(f.target.name||f.target.address)}</div><div>${esc((f.summary||'').slice(0,240))}</div>`;
+  fd.prepend(d);
+}
+function sendWS(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
+document.getElementById('btnStart').onclick=()=>sendWS({action:'start'});
+document.getElementById('btnStop').onclick=()=>sendWS({action:'stop'});
+document.getElementById('btnPause').onclick=()=>sendWS({action:'pause'});
+document.getElementById('addbtn').onclick=()=>{const a=document.getElementById('addr').value.trim();
+  if(a)sendWS({action:'add_target',chain:document.getElementById('chain').value,address:a});document.getElementById('addr').value='';};
+function send(){const i=document.getElementById('chatin');if(i.value.trim()){sendWS({action:'chat',text:i.value.trim()});i.value='';}}
+document.getElementById('send').onclick=send;
+document.getElementById('chatin').addEventListener('keydown',e=>{if(e.key==='Enter')send();});
+fetch('/api/status').then(r=>r.json()).then(s=>{stats(s.stats);
+  if(s.warnings&&s.warnings.length){const w=document.getElementById('warn');w.style.display='block';
+    w.textContent='⚠ '+s.warnings.join('  ·  ');}}).catch(()=>{});
+connect();
+</script>
+</body>
+</html>

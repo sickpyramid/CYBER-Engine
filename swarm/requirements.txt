@@ -1,0 +1,8 @@
+# swarm server + client (Python 3.10+)
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+websockets==14.1
+python-dotenv==1.0.1
+# the engine itself also needs: slither-analyzer, solc-select, requests (see ../requirements.txt)
+# and Foundry (forge/cast) on PATH for the Referee's fork-proving.
