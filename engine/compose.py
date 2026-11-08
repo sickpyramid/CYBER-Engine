@@ -282,15 +282,62 @@ def analyze_composition(target: str, src_root: str, source_keys: list[str],
                       "spot/AMM reserve, flash-loan-move it within one tx",
         })
 
-    # 5. staged chains
+    # 5. trust-delegation seams (where value conservation leaves the Solidity)
+    seams = trust_delegation(src)
+
+    # 6. staged chains
     chains = _build_chains(target, powers, terminals, surfaces, has_timelock)
 
     return {
         "target": target, "chain": chain, "rpc_available": bool(rpc),
         "powers": powers, "roles": resolved, "surfaces": surfaces,
-        "weaknesses": weaknesses, "attack_chains": chains,
-        "summary": _summary(target, terminals, has_timelock, weaknesses, chains),
+        "weaknesses": weaknesses, "trust_delegation": seams, "attack_chains": chains,
+        "summary": _summary(target, terminals, has_timelock, weaknesses, chains, seams),
     }
+
+
+# Where does the contract STOP enforcing value conservation itself and delegate it to an
+# unverifiable component? Those seams are the only places left to attack once the plumbing
+# is balance-delta'd and audited. This is the meta-lesson: find the trust boundary.
+RE_BALANCE_DELTA = re.compile(r"balanceAfter\s*-\s*balanceBefore|balanceOf\([^)]*\)\s*-\s*\w*[Bb]efore|"
+                              r"after\s*-\s*before", re.I)
+RE_VERIFIER_TRUST = re.compile(r"_verifyProof|verifier\.verify|verifyProof", re.I)
+RE_ANY_ROOT = re.compile(r"isKnownRoot|any historical root|ever had this root", re.I)
+
+
+def trust_delegation(src: str) -> list[dict]:
+    """Map the points where on-chain value conservation is HANDED OFF to something the
+    Solidity cannot check: a zk circuit, a balance-delta measurement, an accepted-forever
+    root. These are the real residual attack surface of a well-built protocol."""
+    seams = []
+    if RE_VERIFIER_TRUST.search(src):
+        seams.append({
+            "seam": "value_conservation_delegated_to_circuit",
+            "note": "note/share values are credited/spent against an external SNARK verifier; "
+                    "the contract does NOT (and cannot) check amountIn <= spent-note on-chain. "
+                    "Entire solvency rests on the circuit binding every public input. If the "
+                    "verifier is an immutable blob with no public circuit, this is UNAUDITABLE "
+                    "from bytecode -> that unauditability is itself the finding.",
+            "where_to_hunt": "the circuit (constraint-completeness), not the Solidity",
+        })
+    if RE_BALANCE_DELTA.search(src):
+        seams.append({
+            "seam": "balance_delta_measurement",
+            "note": "an amount is measured as a pool balance delta (handles fee-on-transfer, "
+                    "but trusts that nothing else moves that token between the two reads). "
+                    "Attack only if a transfer hook / reentrancy can inflate the delta with "
+                    "value the attacker does not themselves supply (usually a wash -> not a drain).",
+            "where_to_hunt": "token transfer hooks on whitelisted tokens + reentrancy guard scope",
+        })
+    if RE_ANY_ROOT.search(src):
+        seams.append({
+            "seam": "any_historical_root_accepted",
+            "note": "withdrawals accept any root the tree ever had; double-spend is stopped ONLY "
+                    "by the nullifier set. Correct IF nullifier marking is atomic & pre-transfer. "
+                    "Breaks catastrophically if a verifier swap/upgrade lets a forged proof pass.",
+            "where_to_hunt": "nullifier write-before-transfer + the verifier-swap admin path",
+        })
+    return seams
 
 
 def _build_chains(target, powers, terminals, surfaces, has_timelock) -> list[dict]:
@@ -333,7 +380,7 @@ def _build_chains(target, powers, terminals, surfaces, has_timelock) -> list[dic
     return chains
 
 
-def _summary(target, terminals, has_timelock, weaknesses, chains) -> str:
+def _summary(target, terminals, has_timelock, weaknesses, chains, seams=None) -> str:
     lines = [f"COMPOSITION / ATTACK-GRAPH — {target}"]
     if terminals:
         lines.append("Trust terminals (who really holds each power):")
@@ -344,6 +391,10 @@ def _summary(target, terminals, has_timelock, weaknesses, chains) -> str:
         lines.append("Composition weaknesses:")
         for w in weaknesses:
             lines.append(f"  [{w['severity']}] {w['class']}: {w['detail']}")
+    if seams:
+        lines.append("Trust-delegation seams (where value conservation leaves the Solidity):")
+        for s in seams:
+            lines.append(f"  - {s['seam']}: hunt -> {s['where_to_hunt']}")
     lines.append(f"Staged attack chains: {len(chains)}")
     for c in chains:
         lines.append(f"  * {c['name']} — {c['verdict'][:90]}")
