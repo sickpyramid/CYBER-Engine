@@ -134,6 +134,33 @@ def cmd_system(args):
         print("\n--- escalation check:", check, "---")
         print(json.dumps(system.check_variable(res, check), indent=1, default=str))
 
+def cmd_compose(args):
+    """Composition / attack-graph recon: trust graph + external surfaces + staged chains.
+    Usage: compose <chain> <target_address>
+    Answers the attacker's question: how do I break this using the WHOLE chain?"""
+    from engine import compose, fetch_source
+    import tempfile
+    chain, target = args[0], args[1]
+    # An attacker resolves the proxy FIRST: scan the implementation's logic, but keep every
+    # on-chain role/state call pointed at the proxy (where storage and the admin actually live).
+    impl = compose.impl_address(chain, target)
+    src_addr = impl or target
+    if impl and impl.lower() != target.lower():
+        print(f"[proxy] {target} -> implementation {impl} (scanning impl logic, roles at proxy)")
+    out_dir = tempfile.mkdtemp(prefix="compose_")
+    f = fetch_source.fetch(chain, src_addr, out_dir)
+    if not f or not f.get("src_root"):
+        print(json.dumps({"ok": False, "reason": f"could not fetch verified source for {src_addr}"})); return
+    res = compose.analyze_composition(target, f["src_root"], f.get("source_keys") or [], chain)
+    print(res["summary"])
+    print("\n--- staged attack chains ---")
+    for c in res["attack_chains"]:
+        print(f"\n[{c['name']}]  needs: {c['needs_key']}")
+        for s in c["stages"]:
+            print("   " + s)
+        print("   => " + c["verdict"])
+
+
 def cmd_prove(path):
     """Prove the agent-written PoC on a mainnet fork. `path` = the attempt.sol or its workdir."""
     import shutil
@@ -159,4 +186,5 @@ if __name__ == "__main__":
     elif cmd == "hunt": cmd_hunt(sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else None)
     elif cmd == "prove": cmd_prove(sys.argv[2])
     elif cmd == "system": cmd_system(sys.argv[2:])
+    elif cmd == "compose": cmd_compose(sys.argv[2:])
     else: print("unknown:", cmd); print(__doc__)
