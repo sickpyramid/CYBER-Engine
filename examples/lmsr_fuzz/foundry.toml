@@ -1,0 +1,9 @@
+[profile.default]
+src = "src"
+test = "test"
+libs = ["lib"]
+via_ir = true
+optimizer = true
+remappings = ["@prb/math/=lib/prb-math/", "forge-std/=lib/forge-std/src/"]
+[fuzz]
+runs = 20000
