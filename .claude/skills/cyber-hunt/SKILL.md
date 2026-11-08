@@ -19,6 +19,20 @@ look at an unseen contract and answer **"how do I break this?"** — then prove 
 This is authorized security research (bug bounties / responsible disclosure). Targets are
 public, in-scope contracts; every exploit is run on a local fork, never on mainnet.
 
+## READ THIS FIRST — the deep reasoning protocol
+**`engine/knowledge/reasoning_protocol.md` is the core discipline. Read it before every hunt.**
+Known bugs are already found by bots. The money is in exploits where every line is correct in
+isolation and the drain comes from composing correct parts through another mechanism on-chain.
+Do not grep for bad patterns and stop. Instead: state the protocol's INVARIANTS, list the
+ASSUMPTIONS that defend them, and find the one assumption the code trusts but does not enforce
+on-chain — then build the mechanism that violates it. Interrogate every external call (who's on
+the other end, can the attacker run code there), every value read (where's it from, can it move
+in one tx with a flash loan), every privileged key (hot or cold, fund-critical or ops), and the
+whole rest of the chain (what can an attacker borrow/mint/own/pre-position to break a correct
+function). The knowledge base — `audited_exploits.md`, `attack_sequences.md`, `bounty_research.md`,
+`academic_research.md` — is the corpus of how real drains actually sequenced; `reasoning_protocol.md`
+is how to think with it. These make the engine reason like a hunter, not match like a bot.
+
 ## Setup (once)
 ```bash
 pip install -r requirements.txt          # slither-analyzer, solc-select, requests
