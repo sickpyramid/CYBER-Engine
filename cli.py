@@ -161,6 +161,26 @@ def cmd_compose(args):
         print("   => " + c["verdict"])
 
 
+def cmd_heuristics(args):
+    """Run the audited-exploit heuristics (engine/knowledge/audited_exploits.md) on a target.
+    Usage: heuristics <chain> <address>"""
+    from engine import heuristics, fetch_source, compose
+    import tempfile
+    chain, target = args[0], args[1]
+    impl = compose.impl_address(chain, target)
+    out_dir = tempfile.mkdtemp(prefix="heur_")
+    f = fetch_source.fetch(chain, impl or target, out_dir)
+    if not f or not f.get("src_root"):
+        print(json.dumps({"ok": False, "reason": "no verified source"})); return
+    hits = heuristics.scan(f["src_root"], f.get("source_keys") or [])
+    if impl and impl.lower() != target.lower():
+        print(f"[proxy] {target} -> impl {impl}")
+    if not hits:
+        print("no mechanizable audited-exploit patterns matched (still check the 20 rules by hand)")
+    for h in hits:
+        print(f"[rule {h['rule']}][{h['severity']}] ({h['cases']}) {h['flag']}")
+
+
 def cmd_prove(path):
     """Prove the agent-written PoC on a mainnet fork. `path` = the attempt.sol or its workdir."""
     import shutil
@@ -187,4 +207,5 @@ if __name__ == "__main__":
     elif cmd == "prove": cmd_prove(sys.argv[2])
     elif cmd == "system": cmd_system(sys.argv[2:])
     elif cmd == "compose": cmd_compose(sys.argv[2:])
+    elif cmd == "heuristics": cmd_heuristics(sys.argv[2:])
     else: print("unknown:", cmd); print(__doc__)

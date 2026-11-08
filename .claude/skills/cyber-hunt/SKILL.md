@@ -65,6 +65,22 @@ Returns `{"proven": true/false, "profit_logs", "error", "tail"}`.
   fixes: wrong pool/token address, missing `vm.prank`/approval, wrong function signature,
   flashloan callback shape. The example PoCs show the right patterns for this chain.
 
+## Learn from audited drains — run the heuristics + read the case base
+Audited protocols still get drained. The 10 best-documented cases + 20 FLAG rules distilled
+from them live in `engine/knowledge/audited_exploits.md` — read it; the recurring lesson is
+that the drain lived on a TRUST BOUNDARY the audit assumed safe (an external price feed, a
+vault share price, a token's transfer semantics, a registered market, a ported library, an
+off-chain keeper). Auto-raise the mechanizable subset on any target:
+```bash
+python cli.py heuristics <chain> <address>
+```
+These are CANDIDATES to verify, not verdicts (triage, then confirm each by hand or PoC). The
+oracle/lending family is where forks die: a keeper-pushed price is only as safe as its on-chain
+bound — verify the circuit-breaker / deviation cap is TIGHTER than the asset's real volatility x
+the collateral LTV, or a key compromise walks the price to a drain across windows (Poppie pattern,
+rule 6). For share/vault prices check the virtual-share guard (rule 3); for AMM-read prices check
+TWAP (rule 2); for forks check deployed-vs-audit-date (rule 14).
+
 ## Composition / attack-graph — ALWAYS run this FIRST (think attacker, not auditor)
 Before asking "is this contract sound?", ask the attacker's question: "what does it TRUST
 and CALL that I can bend?" Most drains are composition, not a single-contract bug.
